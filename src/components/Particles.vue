@@ -26,10 +26,11 @@
             this.position.add(this.velocity);
 
             // Bounce off edges
-            if (this.position.x < 0 || this.position.x > this.s.width) {
+            let edge_pad = 3;
+            if (this.position.x - this.radius < 0 + edge_pad || this.position.x + this.radius > this.s.width - edge_pad) {
                 this.velocity.x *= -1;
             }
-            if (this.position.y < 0 || this.position.y > this.s.height) {
+            if (this.position.y - this.radius< 0 + edge_pad || this.position.y  + this.radius > this.s.height - edge_pad) {
                 this.velocity.y *= -1;
             }
 
