@@ -6,5 +6,13 @@ export default {
         BLUE: [59, 177, 228],
         YELLOW: [228, 205, 59] // Yellow: RGB(255, 255, 0)
     },
-    TOTAL_PARTICLES: 3
+    TOTAL_PARTICLES: 3,
+    GRAVITY: {
+        X: 0,
+        Y: 0.1
+    },
+    SPACE: {
+        HEIGHT: 800,
+        WIDTH: 1000
+    }
 }
