@@ -62,7 +62,11 @@
 
                     };
 
-
+                    /**
+                     * Check for merged particles and returns a new array of remaining particles
+                     * @param {Array} particles - array of initial particles
+                     * @returns {Array} - array of remaining merged particles
+                     */
                     function mergeParticles(particles) {
                         let merged = [];
 
@@ -74,7 +78,7 @@
                             for (let j = i - 1; j >= 0; j--) {
                                 let otherParticle = particles[j];
                                 let distanceSq = p5.Vector.sub(currentParticle.position, otherParticle.position).mag();
-                                let minDistanceSq = currentParticle.radius + otherParticle.radius;
+                                let minDistanceSq = currentParticle.radius/2 + otherParticle.radius/2 ;
 
                                 if (distanceSq <= minDistanceSq) {
                                     // Merge particles
@@ -93,6 +97,8 @@
 
                         return merged;
                     } // end of mergeParticles
+
+
                     class Particle {
                         constructor(x, y) {
                             this.position = sketch.createVector(x, y);
