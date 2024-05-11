@@ -15,7 +15,7 @@
             this.position = s.createVector(x, y);
             this.velocity = s.createVector(-1, -1);
             //this.velocity = sketch.createVector(sketch.random(-2, 2), sketch.random(-2, 2)); // Random initial velocity
-            this.mass = 100;
+            this.mass = constants.MAX_MASS / constants.TOTAL_PARTICLES;
             this.radius = Math.sqrt(this.mass); // Particle radius
             this.color = this.getColor(this.mass);
             this.acceleration = s.createVector(constants.GRAVITY.X, constants.GRAVITY.Y);
@@ -26,7 +26,7 @@
             this.position.add(this.velocity);
 
             // Bounce off edges
-            let edge_pad = 3;
+            let edge_pad = 6;
             if (this.position.x - this.radius < 0 + edge_pad || this.position.x + this.radius > this.s.width - edge_pad) {
                 this.velocity.x *= -1;
             }
@@ -115,7 +115,7 @@
 
                         // Create three particles
                         for (let i = 0; i < constants.TOTAL_PARTICLES; i++) {
-                            this.particles.push(new Particle(sketch.random(sketch.width, sketch), sketch.random(sketch.height), sketch));
+                            this.particles.push(new Particle(sketch.random(sketch.width), sketch.random(sketch.height), sketch));
                             //this.particles.push(new Particle(i + 90, i * 100));
                         }
                     };

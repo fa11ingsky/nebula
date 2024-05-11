@@ -16,6 +16,9 @@ coverage
 *.local
 package-lock.json
 
+*.js
+*.js.map
+
 /cypress/videos/
 /cypress/screenshots/
 
