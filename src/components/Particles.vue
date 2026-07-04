@@ -26,7 +26,7 @@
 
             <div class="settings-group">
                 <div class="settings-label">Angular Momentum</div>
-                <label class="settings-row" v-for="value in [10000, 50000, 150000]" :key="'am-' + value">
+                <label class="settings-row" v-for="value in angularMomentumOptions" :key="'am-' + value">
                     <input type="radio" name="angularMomentum" :checked="angularMomentum === value" @change="setAngularMomentum(value)" />
                     {{ value.toLocaleString() }}
                 </label>
@@ -34,7 +34,7 @@
 
             <div class="settings-group">
                 <div class="settings-label">Gravitational Constant</div>
-                <label class="settings-row" v-for="value in [0.1, 1, 2]" :key="'g-' + value">
+                <label class="settings-row" v-for="value in gravitationalConstantOptions" :key="'g-' + value">
                     <input type="radio" name="gravitationalConstant" :checked="gravitationalConstant === value" @change="setGravitationalConstant(value)" />
                     {{ value }}
                 </label>
@@ -42,7 +42,7 @@
 
             <div class="settings-group">
                 <div class="settings-label">Particle Count</div>
-                <label class="settings-row" v-for="value in [100, 1000, 2500]" :key="'p-' + value">
+                <label class="settings-row" v-for="value in totalParticlesOptions" :key="'p-' + value">
                     <input type="radio" name="totalParticles" :checked="totalParticles === value" @change="setTotalParticles(value)" />
                     {{ value.toLocaleString() }}
                 </label>
@@ -347,14 +347,13 @@
         }
     }// end Particle class
 
-    // Mass -> flash color: a tiny merger flickers a dim ember red, a mid-size one flashes
-    // orange/yellow, and the biggest mergers flash an intense blue-white - hotter-reads-as-
-    // more-blue, echoing the same blackbody-ish intuition as the particle color gradient.
+    // Mass -> flash color: red -> blue -> yellow -> white, reusing the same named colors
+    // as the particle mass gradient for visual consistency.
     const EXPLOSION_COLOR_STOPS = [
-        [140, 40, 20],
-        [255, 120, 30],
-        [255, 210, 110],
-        [210, 225, 255],
+        constants.COLORS.RED,
+        constants.COLORS.BLUE,
+        constants.COLORS.YELLOW,
+        constants.COLORS.WHITE,
     ];
 
     /**
@@ -734,6 +733,15 @@
                 angularMomentum: constants.TOTAL_ANGULAR_MOMENTUM,
                 gravitationalConstant: constants.GRAVITATIONAL_CONSTANT,
                 totalParticles: constants.TOTAL_PARTICLES,
+                // Just the option lists for the settings panel's radio groups - defined in
+                // constants.ts so adding/removing choices doesn't need a template change.
+                // Deliberately exposing only these small arrays, not the whole `constants`
+                // object: that object is read directly by the O(n^2) gravity loop every
+                // frame, and making it reactive would route every one of those reads through
+                // a Vue proxy trap for no benefit.
+                angularMomentumOptions: constants.ANGULAR_MOMENTUM_OPTIONS,
+                gravitationalConstantOptions: constants.GRAVITATIONAL_CONSTANT_OPTIONS,
+                totalParticlesOptions: constants.TOTAL_PARTICLES_OPTIONS,
                 // The only per-frame simulation state that's actually reactive - it drives a
                 // small text readout in the debug panel, so it has to be visible to the
                 // template. Updated only while the panel is open (see sketch.draw()) to
