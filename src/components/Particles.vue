@@ -51,6 +51,14 @@
                     {{ value.toLocaleString() }}
                 </label>
             </div>
+
+            <div class="settings-group">
+                <div class="settings-label">Gravity Accuracy (Barnes-Hut &theta;)</div>
+                <label class="settings-row" v-for="value in barnesHutThetaOptions" :key="'bh-' + value">
+                    <input type="radio" name="barnesHutTheta" :checked="barnesHutTheta === value" @change="setBarnesHutTheta(value)" />
+                    {{ value }} {{ value <= 0.3 ? '(precise, slower)' : value >= 1 ? '(fast, coarser)' : '' }}
+                </label>
+            </div>
         </div>
         <div class="controls">
             <button id="stopButton" :class="{ active: stopped }" @click="stopped = !stopped">{{ stopped ? 'Resume' : 'Stop' }}</button>
@@ -109,6 +117,10 @@
             this.mass = mass;
             this.radius = Math.sqrt(this.mass); // Particle radius
             this.color = this.getColor(this.mass);
+            // Cached once here (and again on merge, when color changes) rather than built as
+            // a template-string every display() call - at tens of thousands of particles,
+            // that's tens of thousands of avoidable string allocations per frame.
+            this.colorString = `rgb(${this.color[0]}, ${this.color[1]}, ${this.color[2]})`;
             this.acceleration = s.createVector(constants.GRAVITY.X, constants.GRAVITY.Y);
             this.s = s;
             this.generateSurfaceFeatures();
@@ -227,20 +239,27 @@
             //console.log(`Merge: ${this.radius}`)
             this.mass = totalMass
             this.color = this.getColor(this.mass)
+            this.colorString = `rgb(${this.color[0]}, ${this.color[1]}, ${this.color[2]})`;
             this.generateSurfaceFeatures();
         }
 
         display(texturesEnabled) {
-            this.s.noStroke();
-
             if (!texturesEnabled) {
                 // Cheap fallback: one flat-colored circle, no extra draw calls per particle -
                 // for when the shading/craters/clouds/flares/glow below are costing more than
-                // they're worth at high particle counts.
-                this.s.fill(this.color[0], this.color[1], this.color[2]);
-                this.s.ellipse(this.position.x, this.position.y, this.radius * 2);
+                // they're worth at high particle counts. Goes straight through the canvas
+                // context instead of p5's fill()/ellipse() - at tens of thousands of calls a
+                // frame, p5's per-call argument normalization and state-object overhead adds
+                // up next to a bare arc()+fill().
+                const ctx = this.s.drawingContext;
+                ctx.fillStyle = this.colorString;
+                ctx.beginPath();
+                ctx.arc(this.position.x, this.position.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
                 return;
             }
+
+            this.s.noStroke();
 
             // Surface texture gradually shifts with mass: small bodies are cratered
             // asteroids, mid-mass ones pick up soft cloud cover like a planet, and the
@@ -436,6 +455,14 @@
      */
     class QuadTreeNode {
         constructor(x, y, size) {
+            this.reset(x, y, size);
+        }
+
+        // Reinitializes this node in place so it can be pulled from a pool and reused
+        // instead of allocated fresh - see acquireQuadTreeNode. At tens of thousands of
+        // particles, a tree can easily involve 100K+ node objects; recreating all of them
+        // from scratch every frame is the single biggest source of GC pressure at that scale.
+        reset(x, y, size) {
             this.x = x;
             this.y = y;
             this.size = size;
@@ -445,6 +472,7 @@
             this.mass = 0;
             this.comX = 0;
             this.comY = 0;
+            return this;
         }
 
         insert(particle, depth) {
@@ -495,10 +523,10 @@
         subdivide() {
             const half = this.size / 2;
             this.children = [
-                new QuadTreeNode(this.x, this.y, half),              // NW
-                new QuadTreeNode(this.x + half, this.y, half),        // NE
-                new QuadTreeNode(this.x, this.y + half, half),        // SW
-                new QuadTreeNode(this.x + half, this.y + half, half), // SE
+                acquireQuadTreeNode(this.x, this.y, half),              // NW
+                acquireQuadTreeNode(this.x + half, this.y, half),        // NE
+                acquireQuadTreeNode(this.x, this.y + half, half),        // SW
+                acquireQuadTreeNode(this.x + half, this.y + half, half), // SE
             ];
         }
 
@@ -513,6 +541,26 @@
             return this.children[south * 2 + east];
         }
     } // end QuadTreeNode class
+
+    // Reused across every tree build instead of letting each one allocate 100K+ fresh node
+    // objects at high particle counts. Safe because tree builds within a frame are always
+    // sequential, never concurrent: buildQuadtree() resets the cursor to 0 at the start of
+    // each call, which only happens once the *previous* tree is done being read (merge
+    // detection finishes before gravity's tree is built or reused - see sketch.draw()).
+    const quadTreeNodePool = [];
+    let quadTreeNodePoolCursor = 0;
+
+    function acquireQuadTreeNode(x, y, size) {
+        let node = quadTreeNodePool[quadTreeNodePoolCursor];
+        if (node) {
+            node.reset(x, y, size);
+        } else {
+            node = new QuadTreeNode(x, y, size);
+            quadTreeNodePool.push(node);
+        }
+        quadTreeNodePoolCursor++;
+        return node;
+    }
 
     /**
      * Builds a fresh quadtree covering the swarm. Rebuilt from scratch each time it's needed
@@ -532,6 +580,9 @@
      * and at that distance its exact position barely matters to anyone's force anyway.
      */
     function buildQuadtree(particles) {
+        // Reclaim every node from the last tree built - safe per the pooling note above.
+        quadTreeNodePoolCursor = 0;
+
         const com = computeCenterOfMass(particles);
 
         let sumSqDeviation = 0;
@@ -553,7 +604,7 @@
             particle._treeY = Math.min(Math.max(particle.position.y, rootY), maxCoord);
         }
 
-        const root = new QuadTreeNode(rootX, rootY, size);
+        const root = acquireQuadTreeNode(rootX, rootY, size);
         for (const particle of particles) {
             root.insert(particle, 0);
         }
@@ -1094,6 +1145,7 @@
                 angularMomentum: constants.TOTAL_ANGULAR_MOMENTUM,
                 gravitationalConstant: constants.GRAVITATIONAL_CONSTANT,
                 totalParticles: constants.TOTAL_PARTICLES,
+                barnesHutTheta: constants.BARNES_HUT_THETA,
                 // Just the option lists for the settings panel's radio groups - defined in
                 // constants.ts so adding/removing choices doesn't need a template change.
                 // Deliberately exposing only these small arrays, not the whole `constants`
@@ -1103,6 +1155,7 @@
                 angularMomentumOptions: constants.ANGULAR_MOMENTUM_OPTIONS,
                 gravitationalConstantOptions: constants.GRAVITATIONAL_CONSTANT_OPTIONS,
                 totalParticlesOptions: constants.TOTAL_PARTICLES_OPTIONS,
+                barnesHutThetaOptions: constants.BARNES_HUT_THETA_OPTIONS,
                 // The only per-frame simulation state that's actually reactive - it drives a
                 // small text readout in the debug panel, so it has to be visible to the
                 // template. Updated only while the panel is open (see sketch.draw()) to
@@ -1167,6 +1220,12 @@
                 this.totalParticles = value;
                 constants.TOTAL_PARTICLES = value;
                 this.resetSim();
+            },
+            setBarnesHutTheta(value) {
+                this.barnesHutTheta = value;
+                // Read fresh every frame by applyTreeGravity/accumulatePotentialEnergy, so
+                // this takes effect immediately - no restart needed.
+                constants.BARNES_HUT_THETA = value;
             },
             createCanvas() {
                 this.canvas = new p5((sketch) => {

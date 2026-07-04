@@ -56,13 +56,15 @@ export default {
     // entries here to change what shows up as radio options, no template changes needed.
     ANGULAR_MOMENTUM_OPTIONS: [10000, 50000, 95000, 150000],
     GRAVITATIONAL_CONSTANT_OPTIONS: [0.1, 0.5, 1, 2],
-    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000],
+    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000, 25000, 50000],
     // Barnes-Hut opening angle: a distant cluster of particles is treated as one point mass
     // at its center of mass once (node size / distance) < this, instead of visiting every
     // particle inside it individually. 0.5 is the classic Barnes & Hut (1986) value - a good
     // default balance between speed and force accuracy. Lower = more accurate, slower;
-    // higher = faster, coarser.
+    // higher = faster, coarser (fewer node visits per particle, since aggregation kicks in
+    // sooner) - worth raising as particle count climbs into the tens of thousands.
     BARNES_HUT_THETA: 0.5,
+    BARNES_HUT_THETA_OPTIONS: [0.3, 0.5, 0.8, 1.2],
     // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
     // same point - without this, that would try to subdivide forever. Nodes deeper than this
     // just keep a flat list instead of recursing further.
@@ -81,6 +83,6 @@ export default {
     MIN_MERGE_VELOCITY: 1,
     // How many frames a collision flash lasts, and how large it grows relative to
     // sqrt(combined mass) - i.e. proportional to the merged body's own radius.
-    EXPLOSION_DURATION_FRAMES: 300,
+    EXPLOSION_DURATION_FRAMES: 240,
     EXPLOSION_RADIUS_FACTOR: 2
 }
