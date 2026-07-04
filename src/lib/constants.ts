@@ -56,7 +56,17 @@ export default {
     // entries here to change what shows up as radio options, no template changes needed.
     ANGULAR_MOMENTUM_OPTIONS: [10000, 50000, 95000, 150000],
     GRAVITATIONAL_CONSTANT_OPTIONS: [0.1, 0.5, 1, 2],
-    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500,4000],
+    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000],
+    // Barnes-Hut opening angle: a distant cluster of particles is treated as one point mass
+    // at its center of mass once (node size / distance) < this, instead of visiting every
+    // particle inside it individually. 0.5 is the classic Barnes & Hut (1986) value - a good
+    // default balance between speed and force accuracy. Lower = more accurate, slower;
+    // higher = faster, coarser.
+    BARNES_HUT_THETA: 0.5,
+    // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
+    // same point - without this, that would try to subdivide forever. Nodes deeper than this
+    // just keep a flat list instead of recursing further.
+    QUADTREE_MAX_DEPTH: 24,
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,

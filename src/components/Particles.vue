@@ -422,73 +422,326 @@
     } // end Explosion class
 
     /**
-     * Accumulate the mutual gravitational acceleration between two particles directly
-     * on their `acceleration` vectors (Newton's third law: equal and opposite force).
-     * Softens the force over a length scaled to the pair's own combined radius (instead of
-     * a fixed constant), so gravity stays proportionate to a particle's apparent size as it
-     * grows through merging, and stays finite even at zero separation - removing the need
-     * for an artificial velocity/acceleration cap.
-     * Operates on raw components instead of allocating p5.Vector instances, since this
-     * runs O(n^2) times per frame.
+     * A Barnes-Hut quadtree node: a square region of space that either holds a single
+     * particle directly (or, past QUADTREE_MAX_DEPTH, a small flat bucket of coincident-ish
+     * particles), or has been subdivided into four children. Every node - leaf or internal -
+     * tracks the total mass and center of mass of everything inside it, accumulated
+     * incrementally as particles are inserted, which is what lets a distant node be treated
+     * as a single aggregate body during force/range queries instead of visiting its contents
+     * one by one.
      */
-    function applyGravityPair(a, b, dx, dy, distSq) {
-        const combinedRadius = a.radius + b.radius;
-        const softenedDistSq = distSq + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
-        const dist = Math.sqrt(softenedDistSq);
-        // scalar = G * m_a * m_b / dist^3, so (dx,dy) * scalar is already the force vector a->b
-        const scalar = (constants.GRAVITATIONAL_CONSTANT * a.mass * b.mass) / (softenedDistSq * dist);
-        const fx = dx * scalar;
-        const fy = dy * scalar;
+    class QuadTreeNode {
+        constructor(x, y, size) {
+            this.x = x;
+            this.y = y;
+            this.size = size;
+            this.occupant = null;
+            this.bucket = null;
+            this.children = null;
+            this.mass = 0;
+            this.comX = 0;
+            this.comY = 0;
+        }
 
-        a.acceleration.x += fx / a.mass;
-        a.acceleration.y += fy / a.mass;
+        insert(particle, depth) {
+            // Every node on the insertion path folds this particle into its running
+            // mass-weighted center of mass, regardless of whether it ends up a leaf or
+            // internal node - this is what makes "treat this whole subtree as one point
+            // mass" possible later.
+            if (this.mass === 0) {
+                this.comX = particle.position.x;
+                this.comY = particle.position.y;
+            } else {
+                const newMass = this.mass + particle.mass;
+                this.comX = (this.comX * this.mass + particle.position.x * particle.mass) / newMass;
+                this.comY = (this.comY * this.mass + particle.position.y * particle.mass) / newMass;
+            }
+            this.mass += particle.mass;
 
-        b.acceleration.x -= fx / b.mass;
-        b.acceleration.y -= fy / b.mass;
+            if (this.children) {
+                this.childFor(particle).insert(particle, depth + 1);
+                return;
+            }
+
+            if (this.bucket) {
+                this.bucket.push(particle);
+                return;
+            }
+
+            if (this.occupant === null) {
+                this.occupant = particle;
+                return;
+            }
+
+            if (depth >= constants.QUADTREE_MAX_DEPTH) {
+                // Particles landed on (almost) the same point and there's no room left to
+                // subdivide meaningfully - fall back to a flat list instead of recursing forever.
+                this.bucket = [this.occupant, particle];
+                this.occupant = null;
+                return;
+            }
+
+            this.subdivide();
+            const existing = this.occupant;
+            this.occupant = null;
+            this.childFor(existing).insert(existing, depth + 1);
+            this.childFor(particle).insert(particle, depth + 1);
+        }
+
+        subdivide() {
+            const half = this.size / 2;
+            this.children = [
+                new QuadTreeNode(this.x, this.y, half),              // NW
+                new QuadTreeNode(this.x + half, this.y, half),        // NE
+                new QuadTreeNode(this.x, this.y + half, half),        // SW
+                new QuadTreeNode(this.x + half, this.y + half, half), // SE
+            ];
+        }
+
+        // Uses the particle's clamped _treeX/_treeY (see buildQuadtree) rather than its true
+        // position - that's what keeps a single far-flung outlier from forcing the whole
+        // tree (and every normal, tightly-packed particle in it) through extra levels of
+        // subdivision just to accommodate one point way out on its own.
+        childFor(particle) {
+            const half = this.size / 2;
+            const east = particle._treeX >= this.x + half ? 1 : 0;
+            const south = particle._treeY >= this.y + half ? 1 : 0;
+            return this.children[south * 2 + east];
+        }
+    } // end QuadTreeNode class
+
+    /**
+     * Builds a fresh quadtree covering the swarm. Rebuilt from scratch each time it's needed
+     * (positions change every frame) rather than incrementally updated - at O(n log n) this
+     * is cheap next to the O(n^2) it's replacing.
+     *
+     * Sized off the RMS spread from the center of mass (times a generous safety margin)
+     * rather than the exact min/max extent of every particle. A single particle flung far
+     * away by a slingshot would otherwise balloon a min/max box to its position, forcing
+     * every other, tightly-packed particle through many extra levels of subdivision just to
+     * separate out normally - degrading both performance and, past QUADTREE_MAX_DEPTH,
+     * correctness (falling back to oversized flat buckets that treat distinguishable
+     * particles as an undifferentiated pile). Particles further out than that are clamped to
+     * the tree's boundary for structural purposes only (see childFor) - their true position
+     * and mass still feed the aggregate mass/center-of-mass math untouched, so the physics
+     * stays correct; only which quadrant a stray particle nominally sorts into is affected,
+     * and at that distance its exact position barely matters to anyone's force anyway.
+     */
+    function buildQuadtree(particles) {
+        const com = computeCenterOfMass(particles);
+
+        let sumSqDeviation = 0;
+        for (const particle of particles) {
+            const dx = particle.position.x - com.x;
+            const dy = particle.position.y - com.y;
+            sumSqDeviation += dx * dx + dy * dy;
+        }
+        const rmsSpread = particles.length > 0 ? Math.sqrt(sumSqDeviation / particles.length) : 1;
+
+        const halfSize = Math.max(rmsSpread * 6, 10);
+        const size = halfSize * 2;
+        const rootX = com.x - halfSize;
+        const rootY = com.y - halfSize;
+        const maxCoord = rootX + size * (1 - 1e-9); // just inside the far boundary
+
+        for (const particle of particles) {
+            particle._treeX = Math.min(Math.max(particle.position.x, rootX), maxCoord);
+            particle._treeY = Math.min(Math.max(particle.position.y, rootY), maxCoord);
+        }
+
+        const root = new QuadTreeNode(rootX, rootY, size);
+        for (const particle of particles) {
+            root.insert(particle, 0);
+        }
+        return root;
     }
 
     /**
-     * Applies pairwise gravity and checks for merged particles, returning a new array
-     * of the remaining particles. Every merge appends an Explosion to `explosions`, sized
-     * off the merged body's combined mass.
+     * Accumulates gravitational acceleration onto `particle` from one specific other body,
+     * softened over their combined radius (see GRAVITY_SOFTENING_FACTOR) so the force stays
+     * finite even at zero separation. Only updates `particle`'s own acceleration - see
+     * applyTreeGravity for why that's still momentum-conserving overall.
+     */
+    function applyDirectGravity(particle, other, dx, dy, distSq) {
+        const combinedRadius = particle.radius + other.radius;
+        const softenedDistSq = distSq + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+        const dist = Math.sqrt(softenedDistSq);
+        const scalar = (constants.GRAVITATIONAL_CONSTANT * other.mass) / (softenedDistSq * dist);
+        particle.acceleration.x += dx * scalar;
+        particle.acceleration.y += dy * scalar;
+    }
+
+    /**
+     * Same as applyDirectGravity, but for treating an entire distant subtree as a single
+     * point mass at its center of mass. There's no specific "other body" to size a softening
+     * length from here, but the opening-angle test in applyTreeGravity already guarantees
+     * this is only used when the node is comfortably far away, so a minimal softening off
+     * just this particle's own radius is enough of a safety net.
+     */
+    function applyAggregateGravity(particle, otherMass, dx, dy, distSq) {
+        const softenedDistSq = distSq + particle.radius * particle.radius;
+        const dist = Math.sqrt(softenedDistSq);
+        const scalar = (constants.GRAVITATIONAL_CONSTANT * otherMass) / (softenedDistSq * dist);
+        particle.acceleration.x += dx * scalar;
+        particle.acceleration.y += dy * scalar;
+    }
+
+    /**
+     * Accumulates the total gravitational acceleration on `particle` from everywhere else in
+     * the tree (Barnes-Hut). For a node that's far enough away relative to its size (the
+     * opening-angle test), the whole subtree is treated as one point mass instead of
+     * descending into it - O(log n) node visits per particle instead of O(n).
+     *
+     * On momentum conservation: every particle runs this traversal independently, and only
+     * ever updates its OWN acceleration (never anyone else's). For two individual particles
+     * resolved down to actual leaves, both sides independently compute the same physics from
+     * their own perspective, which is exactly equal-and-opposite by construction - so
+     * near-field interactions stay (numerically, near-exactly) momentum-conserving, the same
+     * as the old direct pairwise sum. Far-field interactions approximated as a cluster are
+     * the exception: only the querying particle gets a force from "the cluster," with no
+     * single reaction applied back to the many individual bodies inside it. That's the real
+     * accuracy/speed trade this algorithm makes - total momentum is very close to conserved,
+     * not exact to the bit, in exchange for going from O(n^2) to O(n log n).
+     */
+    function applyTreeGravity(particle, node) {
+        if (node.mass === 0) {
+            return;
+        }
+
+        const dx = node.comX - particle.position.x;
+        const dy = node.comY - particle.position.y;
+        const distSq = dx * dx + dy * dy;
+
+        if (!node.children) {
+            if (node.occupant !== null) {
+                if (node.occupant !== particle) {
+                    applyDirectGravity(particle, node.occupant, dx, dy, distSq);
+                }
+            } else if (node.bucket) {
+                for (const other of node.bucket) {
+                    if (other === particle) continue;
+                    const odx = other.position.x - particle.position.x;
+                    const ody = other.position.y - particle.position.y;
+                    applyDirectGravity(particle, other, odx, ody, odx * odx + ody * ody);
+                }
+            }
+            return;
+        }
+
+        // Opening-angle test: (size/distance)^2 < theta^2 -> approximate; otherwise descend.
+        if (distSq > 0 && (node.size * node.size) / distSq < constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA) {
+            applyAggregateGravity(particle, node.mass, dx, dy, distSq);
+            return;
+        }
+
+        for (const child of node.children) {
+            applyTreeGravity(particle, child);
+        }
+    }
+
+    /**
+     * Builds one gravity tree and applies it to every particle. Call after
+     * resetAcceleration() and before the second half-kick.
+     */
+    function computeGravity(particles) {
+        const tree = buildQuadtree(particles);
+        for (const particle of particles) {
+            applyTreeGravity(particle, tree);
+        }
+    }
+
+    /**
+     * Collects every particle within searchRadius of `particle` into `out`, pruning subtrees
+     * whose bounding box can't possibly contain a point that close (closest-point-on-box test).
+     */
+    function findMergeCandidates(node, particle, searchRadius, out) {
+        if (node.mass === 0) {
+            return;
+        }
+
+        const closestX = Math.max(node.x, Math.min(particle.position.x, node.x + node.size));
+        const closestY = Math.max(node.y, Math.min(particle.position.y, node.y + node.size));
+        const dx = particle.position.x - closestX;
+        const dy = particle.position.y - closestY;
+        if (dx * dx + dy * dy > searchRadius * searchRadius) {
+            return;
+        }
+
+        if (node.children) {
+            for (const child of node.children) {
+                findMergeCandidates(child, particle, searchRadius, out);
+            }
+            return;
+        }
+
+        if (node.occupant !== null) {
+            if (node.occupant !== particle) {
+                out.push(node.occupant);
+            }
+        } else if (node.bucket) {
+            for (const other of node.bucket) {
+                if (other !== particle) out.push(other);
+            }
+        }
+    }
+
+    /**
+     * Checks for merges via a quadtree range query instead of an all-pairs scan, returning
+     * the surviving particles. Every merge appends an Explosion to `explosions`, sized off
+     * the merged body's combined mass. Pure merge detection only - gravity is computed
+     * separately (computeGravity), against a fresh tree built from the survivors, since the
+     * particle set here can change mid-pass.
      * @param {Array} particles - array of initial particles
      * @param {Array} explosions - collision flashes, mutated in place
      * @returns {Array} - array of remaining merged particles
      */
     function mergeParticles(particles, explosions) {
-        let merged = [];
+        const tree = buildQuadtree(particles);
 
-        for (let i = particles.length - 1; i >= 0; i--) {
-            let currentParticle = particles[i];
-            let didMerge = false;
+        // Upper bound on how far apart two particles could possibly be and still merge
+        // (mergeThreshold = (radius_a + radius_b)/2), so the range query never misses a
+        // legitimate candidate no matter which other particle it turns out to be.
+        let globalMaxRadius = 0;
+        for (const particle of particles) {
+            if (particle.radius > globalMaxRadius) globalMaxRadius = particle.radius;
+        }
 
-            for (let j = i - 1; j >= 0; j--) {
-                let otherParticle = particles[j];
+        const candidates = [];
 
-                let dx = otherParticle.position.x - currentParticle.position.x;
-                let dy = otherParticle.position.y - currentParticle.position.y;
-                let distSq = dx * dx + dy * dy;
-                let minDistance = currentParticle.radius / 2 + otherParticle.radius / 2;
-
-                if (distSq <= minDistance * minDistance) {
-                    // Merge particles
-                    otherParticle.merge(currentParticle);
-                    explosions.push(new Explosion(otherParticle.position.x, otherParticle.position.y, otherParticle.mass));
-                    particles.splice(i, 1);
-                    didMerge = true;
-                    break;
-                }
-
-                applyGravityPair(currentParticle, otherParticle, dx, dy, distSq);
+        for (const particle of particles) {
+            if (particle._removed) {
+                continue;
             }
 
-            // Add current particle if not merged
-            if (!didMerge) {
-                merged.push(currentParticle);
+            candidates.length = 0;
+            findMergeCandidates(tree, particle, (particle.radius + globalMaxRadius) / 2, candidates);
+
+            for (const other of candidates) {
+                if (other._removed) continue;
+
+                const dx = other.position.x - particle.position.x;
+                const dy = other.position.y - particle.position.y;
+                const distSq = dx * dx + dy * dy;
+                const minDistance = (particle.radius + other.radius) / 2;
+
+                if (distSq <= minDistance * minDistance) {
+                    particle.merge(other);
+                    other._removed = true;
+                    explosions.push(new Explosion(particle.position.x, particle.position.y, particle.mass));
+                    break; // one merge per particle per frame, same as before
+                }
             }
         }
 
-        return merged;
+        // Filtered AFTER every particle has had its turn, not committed incrementally
+        // during the loop above: a particle that finds no match on its own turn can still
+        // be absorbed later by a *different* particle's turn in the same pass (merge
+        // candidates come from spatial proximity, not array order, so a particle with two
+        // valid partners only merges with whichever is checked first - the other partner
+        // can still come back for it on its own turn). Committing early left "ghosts": a
+        // particle counted once on its own and again as part of whoever absorbed it later,
+        // duplicating mass out of nowhere every time it happened.
+        return particles.filter((particle) => !particle._removed);
     } // end of mergeParticles
 
     /**
@@ -792,8 +1045,8 @@
             },
             setGravitationalConstant(value) {
                 this.gravitationalConstant = value;
-                // applyGravityPair reads this fresh every frame, so it takes effect
-                // immediately - no restart needed, unlike the other two settings here.
+                // computeGravity's force functions read this fresh every frame, so it takes
+                // effect immediately - no restart needed, unlike the other two settings here.
                 constants.GRAVITATIONAL_CONSTANT = value;
             },
             setTotalParticles(value) {
@@ -841,11 +1094,17 @@
                                 particle.drift();
                             }
 
+                            // Merges use their own quadtree built from pre-merge positions,
+                            // and don't touch acceleration at all - gravity is computed
+                            // separately, right after, against a fresh tree built from the
+                            // survivors (the particle set can change here, so reusing the
+                            // merge-phase tree for forces would mean querying stale data).
+                            this.particles = mergeParticles(this.particles, this.explosions);
+
                             for (let particle of this.particles) {
                                 particle.resetAcceleration();
                             }
-
-                            this.particles = mergeParticles(this.particles, this.explosions);
+                            computeGravity(this.particles);
 
                             for (let particle of this.particles) {
                                 particle.kick(0.5);
