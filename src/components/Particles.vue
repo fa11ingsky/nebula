@@ -23,6 +23,30 @@
                 <input type="checkbox" v-model="crosshairVisible" />
                 Show Crosshair
             </label>
+
+            <div class="settings-group">
+                <div class="settings-label">Angular Momentum</div>
+                <label class="settings-row" v-for="value in [10000, 50000, 150000]" :key="'am-' + value">
+                    <input type="radio" name="angularMomentum" :checked="angularMomentum === value" @change="setAngularMomentum(value)" />
+                    {{ value.toLocaleString() }}
+                </label>
+            </div>
+
+            <div class="settings-group">
+                <div class="settings-label">Gravitational Constant</div>
+                <label class="settings-row" v-for="value in [0.1, 1, 2]" :key="'g-' + value">
+                    <input type="radio" name="gravitationalConstant" :checked="gravitationalConstant === value" @change="setGravitationalConstant(value)" />
+                    {{ value }}
+                </label>
+            </div>
+
+            <div class="settings-group">
+                <div class="settings-label">Particle Count</div>
+                <label class="settings-row" v-for="value in [100, 1000, 2500]" :key="'p-' + value">
+                    <input type="radio" name="totalParticles" :checked="totalParticles === value" @change="setTotalParticles(value)" />
+                    {{ value.toLocaleString() }}
+                </label>
+            </div>
         </div>
         <div class="controls">
             <button id="stopButton" :class="{ active: stopped }" @click="stopped = !stopped">{{ stopped ? 'Resume' : 'Stop' }}</button>
@@ -705,6 +729,11 @@
                 // much at high particle counts. Off by default for that reason.
                 texturesEnabled: false,
                 crosshairVisible: false,
+                // Mirror constants.ts's current values as the selected radio option, so the
+                // settings panel opens already showing what the sim actually started with.
+                angularMomentum: constants.TOTAL_ANGULAR_MOMENTUM,
+                gravitationalConstant: constants.GRAVITATIONAL_CONSTANT,
+                totalParticles: constants.TOTAL_PARTICLES,
                 // The only per-frame simulation state that's actually reactive - it drives a
                 // small text readout in the debug panel, so it has to be visible to the
                 // template. Updated only while the panel is open (see sketch.draw()) to
@@ -744,6 +773,24 @@
             },
             toggleCentralMass() {
                 this.centralMassEnabled = !this.centralMassEnabled;
+                this.resetSim();
+            },
+            setAngularMomentum(value) {
+                this.angularMomentum = value;
+                // Only consumed at spawn time (initializeAngularMomentum), so it needs a
+                // restart to actually take effect.
+                constants.TOTAL_ANGULAR_MOMENTUM = value;
+                this.resetSim();
+            },
+            setGravitationalConstant(value) {
+                this.gravitationalConstant = value;
+                // applyGravityPair reads this fresh every frame, so it takes effect
+                // immediately - no restart needed, unlike the other two settings here.
+                constants.GRAVITATIONAL_CONSTANT = value;
+            },
+            setTotalParticles(value) {
+                this.totalParticles = value;
+                constants.TOTAL_PARTICLES = value;
                 this.resetSim();
             },
             createCanvas() {
@@ -901,6 +948,8 @@
         -webkit-backdrop-filter: blur(6px);
         color: #e8e2ff;
         font-size: 13px;
+        max-height: 70vh;
+        overflow-y: auto;
     }
 
     .settings-row {
@@ -911,11 +960,28 @@
         white-space: nowrap;
     }
 
-    .settings-row input[type='checkbox'] {
+    .settings-row input[type='checkbox'],
+    .settings-row input[type='radio'] {
         width: 14px;
         height: 14px;
         accent-color: #b06cff;
         cursor: pointer;
+    }
+
+    .settings-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding-top: 8px;
+        border-top: 1px solid rgba(138, 92, 246, 0.2);
+    }
+
+    .settings-label {
+        color: #b9a6ff;
+        font-size: 11px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        margin-bottom: 2px;
     }
 
     .controls {
