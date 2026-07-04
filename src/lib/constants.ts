@@ -36,7 +36,7 @@ export default {
     // is ~35% of unsoftened strength and rises to the full, correct value for any separation
     // beyond it - so softening only really bites in the narrow zone below the merge distance
     // that shouldn't normally be reached at all.
-    GRAVITY_SOFTENING_FACTOR: 0.25,
+    GRAVITY_SOFTENING_FACTOR: 200,
     // Net angular momentum (about the system's center of mass) that initial particle velocities are scaled to produce.
     // Sign controls spin direction; magnitude controls how fast the system orbits before gravity reshapes it.
     // Solved, not guessed: the initial velocity field is a rigid-body rotation (v = omega * r),
@@ -64,7 +64,7 @@ export default {
     // higher = faster, coarser (fewer node visits per particle, since aggregation kicks in
     // sooner) - worth raising as particle count climbs into the tens of thousands.
     BARNES_HUT_THETA: 0.5,
-    BARNES_HUT_THETA_OPTIONS: [0.3, 0.5, 0.8, 1.2],
+    BARNES_HUT_THETA_OPTIONS: [0.3, 0.5, 0.8, 1.2, 3],
     // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
     // same point - without this, that would try to subdivide forever. Nodes deeper than this
     // just keep a flat list instead of recursing further.
