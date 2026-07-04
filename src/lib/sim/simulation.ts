@@ -3,6 +3,7 @@
 // Particles.vue actually needs to drive the sketch each frame.
 import { kickAll, driftAll, resetAccelerationAll } from './particleSystem.ts';
 import { mergeParticles } from './merge.ts';
+import { collideParticles } from './collide.ts';
 import { computeGravity } from './gravity.ts';
 import { displayBody } from './particleRender.ts';
 
@@ -13,11 +14,10 @@ export { computeKineticEnergy, computePotentialEnergy } from './energy.ts';
 /**
  * Runs one full physics frame on the given system, mutating it in place.
  *
- * With mergingEnabled false, the merge-detection step is skipped entirely - colliding
- * bodies are never combined into one, so gravity alone (softened at close range, per
- * GRAVITY_SOFTENING_FACTOR) is what keeps them from actually overlapping. The visible
- * effect is a swarm that clumps into tight, dense bunches wherever mass concentrates,
- * instead of consolidating into fewer, larger bodies over time.
+ * With mergingEnabled false, colliding bodies bounce off each other (see collide.ts)
+ * instead of combining into one - momentum- and energy-conserving elastic impulses keep
+ * them from actually overlapping, so the swarm jostles into tight, dense clusters
+ * wherever mass concentrates instead of consolidating into fewer, larger bodies over time.
  * @returns {{state: object, gravityTree: object}}
  */
 export function stepSimulation(system, explosions, mergingEnabled) {
@@ -39,6 +39,10 @@ export function stepSimulation(system, explosions, mergingEnabled) {
         resetAccelerationAll(system);
         gravityTree = computeGravity(system, mergeResult.anyMerged ? null : mergeResult.tree);
     } else {
+        // Collision resolution only touches velocity, never position or count, so unlike
+        // the merge branch there's no stale-tree concern here - gravity always needs its
+        // own fresh tree in this branch regardless.
+        collideParticles(system);
         resetAccelerationAll(system);
         gravityTree = computeGravity(system, null);
     }

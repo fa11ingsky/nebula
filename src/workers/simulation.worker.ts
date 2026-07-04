@@ -36,7 +36,7 @@ let worldCenter = { x: 0, y: 0 };
 
 let stopped = false;
 let centralMassEnabled = false;
-let mergingEnabled = true;
+let mergingEnabled = false;
 let texturesEnabled = false;
 let crosshairVisible = false;
 let explosionsEnabled = false;

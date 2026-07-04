@@ -80,6 +80,12 @@ function mergeInto(system, i, j) {
  * the system in place so the live set stays contiguous at [0, count). Every merge appends
  * an Explosion to `explosions`, sized off the merged body's combined mass. Pure merge
  * detection only - gravity is applied separately (see gravity.ts's computeGravity).
+ *
+ * Uses continuous (swept) collision detection, not just an end-of-frame distance check -
+ * without it, a particle whipping past a large mass at high speed (e.g. a close pass near
+ * an enabled central mass) can cross the entire merge-distance window within one frame and
+ * never register as touching on either end of the encounter, so it just slingshots away at
+ * whatever speed the close approach gave it instead of sticking.
  * @param {object} system - the ParticleSystem, mutated in place
  * @param {Array} explosions - collision flashes, mutated in place
  * @returns {{tree: QuadTreeNode, anyMerged: boolean}} - the tree built to find merges
@@ -110,29 +116,57 @@ export function mergeParticles(system, explosions) {
             continue;
         }
 
+        // Widened by this particle's own per-frame displacement (driftAll moves a
+        // particle by its full velocity each frame, so that displacement IS its speed
+        // here) so the search still reaches back along the path it just swept through,
+        // not just the small neighborhood around where it ended up. Without this, a body
+        // whipping past close to a large mass at high speed can cross the entire merge-
+        // distance window within a single frame and never turn up as a candidate for
+        // anyone on either end of the encounter - see the closest-approach check below
+        // for why that's still not enough on its own.
+        const speedI = Math.sqrt(system.velX[i] * system.velX[i] + system.velY[i] * system.velY[i]);
         candidates.length = 0;
-        findMergeCandidates(system, tree, i, (system.radius[i] + globalMaxRadius) / 2, candidates);
+        findMergeCandidates(system, tree, i, (system.radius[i] + globalMaxRadius) / 2 + speedI, candidates);
 
         for (const j of candidates) {
             if (system.removed[j]) continue;
 
-            const dx = system.posX[j] - system.posX[i];
-            const dy = system.posY[j] - system.posY[i];
-            const distSq = dx * dx + dy * dy;
+            // Checking only where i and j ended up after this frame's drift misses a fast,
+            // close flyby that crosses within merge distance mid-frame but ends the frame
+            // well past it in either direction ("tunneling" - the classic failure mode of
+            // sampling collisions only at discrete time steps). Since both particles move
+            // in a straight line at constant velocity over a single drift step, the
+            // closest approach between them during that step has a closed-form solution:
+            // minimize |relativePosition(t)| for t in [0,1].
+            const relVx = system.velX[j] - system.velX[i];
+            const relVy = system.velY[j] - system.velY[i];
+            const relSpeedSq = relVx * relVx + relVy * relVy;
+
+            const endDx = system.posX[j] - system.posX[i];
+            const endDy = system.posY[j] - system.posY[i];
+            // Relative position before this frame's drift: the end position minus the
+            // relative displacement drift just applied - reconstructs "before" without
+            // needing to have stored it separately, since drift moves each particle by
+            // exactly its own velocity.
+            const startDx = endDx - relVx;
+            const startDy = endDy - relVy;
+
+            let t = relSpeedSq > 1e-9 ? -(startDx * relVx + startDy * relVy) / relSpeedSq : 0;
+            t = Math.min(Math.max(t, 0), 1);
+
+            const closestDx = startDx + t * relVx;
+            const closestDy = startDy + t * relVy;
+            const minDistSq = closestDx * closestDx + closestDy * closestDy;
             const minDistance = (system.radius[i] + system.radius[j]) / 2;
 
-            if (distSq > minDistance * minDistance) {
-                continue; // not touching at all
+            if (minDistSq > minDistance * minDistance) {
+                continue; // never came close enough at any point during this frame
             }
 
             // Touching isn't enough on its own - a slow graze (e.g. two bodies briefly
             // in contact while drifting past each other in similar orbits) just passes
             // through instead of fusing. Only a close approach with enough relative
             // (closing) speed actually merges.
-            const relVx = system.velX[j] - system.velX[i];
-            const relVy = system.velY[j] - system.velY[i];
-            const relSpeedSq = relVx * relVx + relVy * relVy;
-
             if (relSpeedSq < constants.MIN_MERGE_VELOCITY * constants.MIN_MERGE_VELOCITY) {
                 continue; // touching, but too gentle to fuse
             }

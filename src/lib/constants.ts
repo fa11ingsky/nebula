@@ -36,7 +36,7 @@ export default {
     // is ~35% of unsoftened strength and rises to the full, correct value for any separation
     // beyond it - so softening only really bites in the narrow zone below the merge distance
     // that shouldn't normally be reached at all.
-    GRAVITY_SOFTENING_FACTOR: 200,
+    GRAVITY_SOFTENING_FACTOR: 2000,
     // Net angular momentum (about the system's center of mass) that initial particle velocities are scaled to produce.
     // Sign controls spin direction; magnitude controls how fast the system orbits before gravity reshapes it.
     // Solved, not guessed: the initial velocity field is a rigid-body rotation (v = omega * r),
@@ -72,8 +72,21 @@ export default {
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,
-    // Mass of the optional central body, as a fraction of MAX_MASS (the swarm's total mass).
+    // The optional central mass isn't one dominant body - it's a dense cluster of
+    // ordinary swarm particles (same per-particle mass as everyone else) spawned within a
+    // small radius at the center instead of spread across the whole disc. This is that
+    // cluster's share of the total particle count (and so, since every particle has equal
+    // mass, of MAX_MASS too) - e.g. 0.2 with TOTAL_PARTICLES=2500 means 500 of those 2500
+    // particles spawn packed into the center instead of scattered through the disc.
     CENTRAL_MASS_FRACTION: 0.2,
+    // How tightly packed that central cluster spawns, as a fraction of the swarm's own
+    // spawn radius - small enough to read as a dense "core" rather than just a denser
+    // patch of the same disc, but not a literal single point (letting the cluster's own
+    // particles start at slightly different positions avoids spawning many bodies exactly
+    // coincident, which is otherwise harmless - softening and the quadtree's bucket
+    // fallback both handle it - but looks like a visual glitch before gravity pulls them
+    // into a natural clump anyway).
+    CENTRAL_CLUSTER_RADIUS_FRACTION: 0.05,
     // Two particles within merge distance only actually fuse if their relative (closing)
     // speed is at least this - a slow graze just passes through without merging. This is a
     // deliberately small default: it's meant to filter out only the gentlest near-misses
@@ -84,5 +97,13 @@ export default {
     // How many frames a collision flash lasts, and how large it grows relative to
     // sqrt(combined mass) - i.e. proportional to the merged body's own radius.
     EXPLOSION_DURATION_FRAMES: 240,
-    EXPLOSION_RADIUS_FACTOR: 2
+    EXPLOSION_RADIUS_FACTOR: 2,
+    // With merging disabled, colliding particles bounce off each other instead (see
+    // collide.ts) - this is the coefficient of restitution for that bounce: the fraction
+    // of closing speed preserved (reversed) afterward. 1 would be a perfectly elastic
+    // billiard-ball collision (kinetic energy exactly conserved); 0.5 keeps only half the
+    // closing speed, so each collision bleeds some kinetic energy as "heat" - closer to
+    // how real solid material collides, and lets a jostling cluster gradually settle down
+    // instead of bouncing at full energy indefinitely.
+    COLLISION_RESTITUTION: 0.5
 }

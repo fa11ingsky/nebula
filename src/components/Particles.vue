@@ -88,10 +88,11 @@
             return {
                 stopped: false,
                 centralMassEnabled: false,
-                // With merging off, colliding bodies are never combined - gravity alone
-                // (softened at close range) keeps them apart, so the swarm clumps into
-                // tight, dense bunches instead of consolidating into fewer, larger bodies.
-                mergingEnabled: true,
+                // With merging off (the default), colliding bodies bounce off each other
+                // instead of combining - momentum- and energy-conserving elastic impulses
+                // (see collide.ts) keep them apart, so the swarm jostles into tight,
+                // dense clusters instead of consolidating into fewer, larger bodies.
+                mergingEnabled: false,
                 debugPanelVisible: false,
                 settingsOpen: false,
                 // Lets the surface-texture rendering (spherical shading/craters/clouds/flares/glow)
