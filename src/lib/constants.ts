@@ -9,7 +9,7 @@ export default {
         YELLOW: [255, 221, 51],
         WHITE: [255, 255, 255]
     },
-    TOTAL_PARTICLES: 2000,
+    TOTAL_PARTICLES: 2500,
     GRAVITY: {
         X: 0,
         Y: 0
@@ -25,12 +25,12 @@ export default {
     // Raised toward the system's rough virial value (where centrifugal motion balances
     // gravity) so particles settle into calmer, more circular orbits instead of head-on
     // plunges - those plunges are what was flinging particles out via close encounters.
-    TOTAL_ANGULAR_MOMENTUM: 200000,
+    TOTAL_ANGULAR_MOMENTUM: 150000,
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,
     // Mass of the optional central body, as a fraction of MAX_MASS (the swarm's total mass).
-    CENTRAL_MASS_FRACTION: 0.4,
+    CENTRAL_MASS_FRACTION: 0.2,
     // How many frames a collision flash lasts, and how large it grows relative to
     // sqrt(combined mass) - i.e. proportional to the merged body's own radius.
     EXPLOSION_DURATION_FRAMES: 120,

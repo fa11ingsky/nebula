@@ -19,6 +19,10 @@
                 <input type="checkbox" v-model="texturesEnabled" />
                 Enable Textures
             </label>
+            <label class="settings-row">
+                <input type="checkbox" v-model="crosshairVisible" />
+                Show Crosshair
+            </label>
         </div>
         <div class="controls">
             <button id="stopButton" :class="{ active: stopped }" @click="stopped = !stopped">{{ stopped ? 'Resume' : 'Stop' }}</button>
@@ -54,6 +58,20 @@
         ];
     }
 
+    /**
+     * Blends [r,g,b] toward white (amount > 0) or black (amount < 0) by the given fraction.
+     * Used to build a highlight/shadow pair from a body's base color for spherical shading.
+     */
+    function shadeColor([r, g, b], amount) {
+        const target = amount > 0 ? 255 : 0;
+        const t = Math.min(Math.abs(amount), 1);
+        return [
+            Math.round(r + (target - r) * t),
+            Math.round(g + (target - g) * t),
+            Math.round(b + (target - b) * t),
+        ];
+    }
+
     class Particle {
         constructor(x, y, s, mass = constants.MAX_MASS / constants.TOTAL_PARTICLES) {
             this.position = s.createVector(x, y);
@@ -75,10 +93,15 @@
         // just read as noise. Regenerated on merge() so a newly combined body gets its own
         // fresh surface instead of inheriting one twin's exact pattern.
         generateSurfaceFeatures() {
-            this.craters = Array.from({ length: 5 }, () => ({
-                angle: Math.random() * Math.PI * 2,
-                dist: Math.random() * 0.55,
-                size: 0.15 + Math.random() * 0.25,
+            // Fewer craters, each nudged into its own ~120-degree sector with a tighter size
+            // range, so three independently-placed dimples don't keep landing on top of
+            // each other the way five loosely-scattered ones tended to.
+            const craterCount = 3;
+            const craterSector = (Math.PI * 2) / craterCount;
+            this.craters = Array.from({ length: craterCount }, (_, i) => ({
+                angle: craterSector * i + Math.random() * craterSector * 0.7,
+                dist: 0.15 + Math.random() * 0.35,
+                size: 0.1 + Math.random() * 0.15,
             }));
 
             this.clouds = Array.from({ length: 4 }, () => ({
@@ -95,6 +118,48 @@
             }));
 
             this.glowPulsePhase = Math.random() * Math.PI * 2;
+
+            // Only bodies squarely in the "planet" mass range are even eligible, and even
+            // then it's a coin flip - "some planets", not all of them.
+            const t = Math.min(Math.max(this.mass / constants.MAX_MASS, 0), 1);
+            const eligibleForRing = t > 0.25 && t < 0.8;
+            this.hasRing = eligibleForRing && Math.random() < 0.35;
+            if (this.hasRing) {
+                this.ring = {
+                    angle: (Math.random() - 0.5) * 0.6, // mostly horizontal, slight tilt variety
+                    tilt: 0.25 + Math.random() * 0.15, // vertical squash, like a ring seen edge-on-ish
+                    innerScale: 1.4 + Math.random() * 0.15,
+                    outerScale: 2.0 + Math.random() * 0.4,
+                    color: shadeColor([205, 185, 145], (Math.random() - 0.5) * 0.3),
+                };
+            }
+        }
+
+        // Draws one half of the ring as an annulus segment (outer arc, then the inner arc
+        // traced backwards to cut the hole) in the ring's own tilted/rotated local space.
+        // half=0 draws the far/back half, half=1 the near/front half.
+        drawRingHalf(half) {
+            const ctx = this.s.drawingContext;
+            const outerRadius = this.radius * this.ring.outerScale;
+            const innerRadius = this.radius * this.ring.innerScale;
+            const startAngle = half === 0 ? Math.PI : 0;
+            const endAngle = half === 0 ? Math.PI * 2 : Math.PI;
+
+            ctx.save();
+            ctx.translate(this.position.x, this.position.y);
+            ctx.rotate(this.ring.angle);
+            ctx.scale(1, this.ring.tilt);
+
+            ctx.beginPath();
+            ctx.arc(0, 0, outerRadius, startAngle, endAngle);
+            ctx.arc(0, 0, innerRadius, endAngle, startAngle, true);
+            ctx.closePath();
+
+            const [r, g, b] = this.ring.color;
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.6)`;
+            ctx.fill();
+
+            ctx.restore();
         }
 
         resetAcceleration() {
@@ -142,9 +207,9 @@
 
             if (!texturesEnabled) {
                 // Cheap fallback: one flat-colored circle, no extra draw calls per particle -
-                // for when the craters/clouds/flares/glow below are costing more than they're
-                // worth at high particle counts.
-                this.s.fill(this.color);
+                // for when the shading/craters/clouds/flares/glow below are costing more than
+                // they're worth at high particle counts.
+                this.s.fill(this.color[0], this.color[1], this.color[2]);
                 this.s.ellipse(this.position.x, this.position.y, this.radius * 2);
                 return;
             }
@@ -155,7 +220,7 @@
             // overlap deliberately, so the look drifts between categories instead of
             // snapping between them.
             const t = Math.min(Math.max(this.mass / constants.MAX_MASS, 0), 1);
-            const asteroidWeight = Math.max(0, 1 - t / 0.4);
+            const asteroidWeight = Math.max(0, 1 - t / 0.3);
             const cloudWeight = Math.max(0, 1 - Math.abs(t - 0.5) / 0.35);
             const sunWeight = Math.max(0, (t - 0.6) / 0.4);
 
@@ -176,9 +241,32 @@
                 ctx.fill();
             }
 
-            // Base body.
-            this.s.fill(this.color);
-            this.s.ellipse(this.position.x, this.position.y, this.radius * 2);
+            // Ring, back half: drawn before the body so it passes behind the far side.
+            if (this.hasRing) {
+                this.drawRingHalf(0);
+            }
+
+            // Base body: a radial gradient offset toward one corner (rather than a flat fill)
+            // reads as a lit sphere - bright highlight facing the light, base color across
+            // the middle, darkening toward the far limb - instead of a flat painted disc.
+            {
+                const [hr, hg, hb] = shadeColor(this.color, 0.55);
+                const [dr, dg, db] = shadeColor(this.color, -0.6);
+                const lightOffset = this.radius * 0.35;
+                const ctx = this.s.drawingContext;
+                const sphereGradient = ctx.createRadialGradient(
+                    this.position.x - lightOffset, this.position.y - lightOffset, this.radius * 0.05,
+                    this.position.x, this.position.y, this.radius * 1.05
+                );
+                sphereGradient.addColorStop(0, `rgb(${hr}, ${hg}, ${hb})`);
+                sphereGradient.addColorStop(0.5, `rgb(${this.color[0]}, ${this.color[1]}, ${this.color[2]})`);
+                sphereGradient.addColorStop(1, `rgb(${dr}, ${dg}, ${db})`);
+
+                ctx.fillStyle = sphereGradient;
+                ctx.beginPath();
+                ctx.arc(this.position.x, this.position.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+            }
 
             // Asteroid craters: small dark dimples, strongest for the smallest bodies.
             if (asteroidWeight > 0.05) {
@@ -200,6 +288,11 @@
                 }
             }
 
+            // Ring, front half: drawn after the body (and clouds) so it passes in front of the near side.
+            if (this.hasRing) {
+                this.drawRingHalf(1);
+            }
+
             // Surface flares: bright, gently flickering mottling once the body runs hot enough to be sun-like.
             if (sunWeight > 0.05) {
                 this.s.fill(255, 255, 220, 160 * sunWeight);
@@ -215,6 +308,8 @@
         getColor(mass) {
             // Sweeps through the full stop sequence (brown -> blue -> green -> red -> yellow
             // -> white) as mass goes from 0 to MAX_MASS, so the heaviest particle turns white.
+            // Returned as an [r,g,b] array (rather than a CSS string) so display() can shade
+            // it into a highlight/shadow pair for the spherical lighting effect.
             const stops = [
                 constants.COLORS.BROWN,
                 constants.COLORS.BLUE,
@@ -224,8 +319,7 @@
                 constants.COLORS.WHITE,
             ];
 
-            const [r, g, b] = interpolateColorStops(stops, mass / constants.MAX_MASS);
-            return `rgb(${r}, ${g}, ${b})`;
+            return interpolateColorStops(stops, mass / constants.MAX_MASS);
         }
     }// end Particle class
 
@@ -606,10 +700,11 @@
                 centralMassEnabled: false,
                 debugPanelVisible: false,
                 settingsOpen: false,
-                // Lets the surface-texture rendering (craters/clouds/flares/glow) be switched
-                // off to fall back to plain flat circles when it's costing too much at high
-                // particle counts.
-                texturesEnabled: true,
+                // Lets the surface-texture rendering (spherical shading/craters/clouds/flares/glow)
+                // be switched off to fall back to plain flat circles when it's costing too
+                // much at high particle counts. Off by default for that reason.
+                texturesEnabled: false,
+                crosshairVisible: false,
                 // The only per-frame simulation state that's actually reactive - it drives a
                 // small text readout in the debug panel, so it has to be visible to the
                 // template. Updated only while the panel is open (see sketch.draw()) to
@@ -741,10 +836,12 @@
 
                             // Marks the center of mass - should render pinned to the middle
                             // of the screen every frame, since the camera is centered on it.
-                            sketch.stroke(255);
-                            sketch.strokeWeight(1.5);
-                            sketch.line(com.x - 8, com.y, com.x + 8, com.y);
-                            sketch.line(com.x, com.y - 8, com.x, com.y + 8);
+                            if (this.crosshairVisible) {
+                                sketch.stroke(255);
+                                sketch.strokeWeight(1.5);
+                                sketch.line(com.x - 8, com.y, com.x + 8, com.y);
+                                sketch.line(com.x, com.y - 8, com.x, com.y + 8);
+                            }
 
                             sketch.pop();
                         }
