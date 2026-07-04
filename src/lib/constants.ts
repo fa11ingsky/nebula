@@ -72,6 +72,13 @@ export default {
     SPAWN_RADIUS_FRACTION: 0.95,
     // Mass of the optional central body, as a fraction of MAX_MASS (the swarm's total mass).
     CENTRAL_MASS_FRACTION: 0.2,
+    // Two particles within merge distance only actually fuse if their relative (closing)
+    // speed is at least this - a slow graze just passes through without merging. This is a
+    // deliberately small default: it's meant to filter out only the gentlest near-misses
+    // (e.g. two bodies briefly touching while drifting past each other in similar orbits),
+    // not to block normal accretion. Tune it up if too many low-speed touches are still
+    // fusing, or down toward 0 to go back to "any contact merges."
+    MIN_MERGE_VELOCITY: 1,
     // How many frames a collision flash lasts, and how large it grows relative to
     // sqrt(combined mass) - i.e. proportional to the merged body's own radius.
     EXPLOSION_DURATION_FRAMES: 300,

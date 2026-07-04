@@ -5,6 +5,10 @@
             <div class="debug-title">Center of Mass</div>
             <div>x: {{ centerOfMass.x.toFixed(2) }}</div>
             <div>y: {{ centerOfMass.y.toFixed(2) }}</div>
+            <div class="debug-title">Energy</div>
+            <div>kinetic:   {{ kineticEnergy.toFixed(2) }}</div>
+            <div>potential: {{ potentialEnergy.toFixed(2) }}</div>
+            <div>total:     {{ (kineticEnergy + potentialEnergy).toFixed(2) }}</div>
         </div>
         <div class="settings-panel" v-if="settingsOpen">
             <label class="settings-row">
@@ -640,14 +644,101 @@
     }
 
     /**
-     * Builds one gravity tree and applies it to every particle. Call after
-     * resetAcceleration() and before the second half-kick.
+     * Applies gravity to every particle, building a tree first unless one is already
+     * provided. Call after resetAcceleration() and before the second half-kick.
+     *
+     * Accepting a pre-built tree lets the caller skip a second full rebuild on frames where
+     * nothing merged: positions haven't changed since the merge-detection tree was built, so
+     * that tree is already exactly correct for gravity too. Rebuilding it anyway would be
+     * pure waste - and became a bigger one once merges got rarer (see mergeParticles' notes
+     * on MIN_MERGE_VELOCITY), since more frames now have nothing merge on them at all.
      */
-    function computeGravity(particles) {
-        const tree = buildQuadtree(particles);
+    function computeGravity(particles, tree) {
+        const gravityTree = tree || buildQuadtree(particles);
         for (const particle of particles) {
-            applyTreeGravity(particle, tree);
+            applyTreeGravity(particle, gravityTree);
         }
+        return gravityTree;
+    }
+
+    /**
+     * Total kinetic energy of the system: sum(0.5 * m * v^2). Exact, O(n) - no approximation
+     * needed here, unlike potential energy below.
+     */
+    function computeKineticEnergy(particles) {
+        let ke = 0;
+        for (const particle of particles) {
+            const speedSq = particle.velocity.x * particle.velocity.x + particle.velocity.y * particle.velocity.y;
+            ke += 0.5 * particle.mass * speedSq;
+        }
+        return ke;
+    }
+
+    /**
+     * Accumulates the gravitational potential energy between `particle` and everything else
+     * in the tree, using the exact same direct/aggregate split (and opening-angle criterion)
+     * as applyTreeGravity - so this is a Barnes-Hut approximation of PE, not an exact sum,
+     * consistent with the fact that the forces driving this simulation are approximated the
+     * same way. Softened the same way as force (see applyDirectGravity/applyAggregateGravity)
+     * so a pair well inside the merge threshold doesn't produce a singular energy value.
+     */
+    function accumulatePotentialEnergy(particle, node) {
+        if (node.mass === 0) {
+            return 0;
+        }
+
+        const dx = node.comX - particle.position.x;
+        const dy = node.comY - particle.position.y;
+        const distSq = dx * dx + dy * dy;
+
+        if (!node.children) {
+            if (node.occupant !== null) {
+                if (node.occupant === particle) {
+                    return 0;
+                }
+                const combinedRadius = particle.radius + node.occupant.radius;
+                const softenedDistSq = distSq + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+                return -(constants.GRAVITATIONAL_CONSTANT * particle.mass * node.occupant.mass) / Math.sqrt(softenedDistSq);
+            }
+            if (node.bucket) {
+                let pe = 0;
+                for (const other of node.bucket) {
+                    if (other === particle) continue;
+                    const odx = other.position.x - particle.position.x;
+                    const ody = other.position.y - particle.position.y;
+                    const combinedRadius = particle.radius + other.radius;
+                    const softenedDistSq = odx * odx + ody * ody + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+                    pe += -(constants.GRAVITATIONAL_CONSTANT * particle.mass * other.mass) / Math.sqrt(softenedDistSq);
+                }
+                return pe;
+            }
+            return 0;
+        }
+
+        if (distSq > 0 && (node.size * node.size) / distSq < constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA) {
+            const softenedDistSq = distSq + particle.radius * particle.radius;
+            return -(constants.GRAVITATIONAL_CONSTANT * particle.mass * node.mass) / Math.sqrt(softenedDistSq);
+        }
+
+        let pe = 0;
+        for (const child of node.children) {
+            pe += accumulatePotentialEnergy(particle, child);
+        }
+        return pe;
+    }
+
+    /**
+     * Total gravitational potential energy of the system, reusing the same tree already
+     * built for gravity this frame rather than a third rebuild. Every particle traverses the
+     * tree independently (same as applyTreeGravity), so each real pair's energy gets counted
+     * once from each side - hence the final /2.
+     */
+    function computePotentialEnergy(particles, tree) {
+        let pe = 0;
+        for (const particle of particles) {
+            pe += accumulatePotentialEnergy(particle, tree);
+        }
+        return pe / 2;
     }
 
     /**
@@ -688,12 +779,14 @@
     /**
      * Checks for merges via a quadtree range query instead of an all-pairs scan, returning
      * the surviving particles. Every merge appends an Explosion to `explosions`, sized off
-     * the merged body's combined mass. Pure merge detection only - gravity is computed
-     * separately (computeGravity), against a fresh tree built from the survivors, since the
-     * particle set here can change mid-pass.
+     * the merged body's combined mass. Pure merge detection only - gravity is applied
+     * separately (computeGravity).
      * @param {Array} particles - array of initial particles
      * @param {Array} explosions - collision flashes, mutated in place
-     * @returns {Array} - array of remaining merged particles
+     * @returns {{particles: Array, tree: QuadTreeNode, anyMerged: boolean}} - the surviving
+     *   particles, the tree built to find them (reusable for gravity only if anyMerged is
+     *   false - a merge mutates the survivor's position/mass, which would make this tree
+     *   stale for it), and whether anything actually merged this frame.
      */
     function mergeParticles(particles, explosions) {
         const tree = buildQuadtree(particles);
@@ -724,12 +817,26 @@
                 const distSq = dx * dx + dy * dy;
                 const minDistance = (particle.radius + other.radius) / 2;
 
-                if (distSq <= minDistance * minDistance) {
-                    particle.merge(other);
-                    other._removed = true;
-                    explosions.push(new Explosion(particle.position.x, particle.position.y, particle.mass));
-                    break; // one merge per particle per frame, same as before
+                if (distSq > minDistance * minDistance) {
+                    continue; // not touching at all
                 }
+
+                // Touching isn't enough on its own - a slow graze (e.g. two bodies briefly
+                // in contact while drifting past each other in similar orbits) just passes
+                // through instead of fusing. Only a close approach with enough relative
+                // (closing) speed actually merges.
+                const relVx = other.velocity.x - particle.velocity.x;
+                const relVy = other.velocity.y - particle.velocity.y;
+                const relSpeedSq = relVx * relVx + relVy * relVy;
+
+                if (relSpeedSq < constants.MIN_MERGE_VELOCITY * constants.MIN_MERGE_VELOCITY) {
+                    continue; // touching, but too gentle to fuse
+                }
+
+                particle.merge(other);
+                other._removed = true;
+                explosions.push(new Explosion(particle.position.x, particle.position.y, particle.mass));
+                break; // one merge per particle per frame, same as before
             }
         }
 
@@ -741,7 +848,8 @@
         // can still come back for it on its own turn). Committing early left "ghosts": a
         // particle counted once on its own and again as part of whoever absorbed it later,
         // duplicating mass out of nowhere every time it happened.
-        return particles.filter((particle) => !particle._removed);
+        const survivors = particles.filter((particle) => !particle._removed);
+        return { particles: survivors, tree, anyMerged: survivors.length !== particles.length };
     } // end of mergeParticles
 
     /**
@@ -999,7 +1107,13 @@
                 // small text readout in the debug panel, so it has to be visible to the
                 // template. Updated only while the panel is open (see sketch.draw()) to
                 // avoid triggering a Vue re-render 60 times a second for no reason.
-                centerOfMass: { x: 0, y: 0 }
+                centerOfMass: { x: 0, y: 0 },
+                // Mergers are perfectly inelastic, so unlike momentum/angular momentum this
+                // is expected to visibly drop at each collision (radiated away as the "heat"
+                // the explosion effect represents) rather than stay constant - that's the
+                // point of tracking it.
+                kineticEnergy: 0,
+                potentialEnergy: 0
             };
         },
 
@@ -1095,19 +1209,29 @@
                             }
 
                             // Merges use their own quadtree built from pre-merge positions,
-                            // and don't touch acceleration at all - gravity is computed
-                            // separately, right after, against a fresh tree built from the
-                            // survivors (the particle set can change here, so reusing the
-                            // merge-phase tree for forces would mean querying stale data).
-                            this.particles = mergeParticles(this.particles, this.explosions);
+                            // and don't touch acceleration at all - gravity is applied
+                            // separately, right after. On the (increasingly common, since
+                            // MIN_MERGE_VELOCITY filters out most touches) frames where
+                            // nothing actually merged, the merge-phase tree is still exactly
+                            // correct for gravity too - positions didn't change - so it's
+                            // reused instead of paying for a second full rebuild.
+                            const mergeResult = mergeParticles(this.particles, this.explosions);
+                            this.particles = mergeResult.particles;
 
                             for (let particle of this.particles) {
                                 particle.resetAcceleration();
                             }
-                            computeGravity(this.particles);
+                            const gravityTree = computeGravity(this.particles, mergeResult.anyMerged ? null : mergeResult.tree);
 
                             for (let particle of this.particles) {
                                 particle.kick(0.5);
+                            }
+
+                            if (this.debugPanelVisible) {
+                                // Reuses the tree gravity already built this frame rather than
+                                // a third rebuild just for this readout.
+                                this.kineticEnergy = computeKineticEnergy(this.particles);
+                                this.potentialEnergy = computePotentialEnergy(this.particles, gravityTree);
                             }
 
                             for (let explosion of this.explosions) {
