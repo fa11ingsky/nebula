@@ -35,10 +35,12 @@ src/lib/
     particleRender.ts     drawing one body to canvas
     nebulaBackground.ts   static starfield/nebula backdrop
     particleSystem.ts     the typed-array store + kick/drift/reset/COM/copy
-    quadtree.ts           Barnes-Hut tree (pooled nodes, build)
+    quadtree.ts           Barnes-Hut tree: flat typed-array nodes, iterative
+                          next-pointer traversal, deferred bottom-up COM propagation
     gravity.ts            tree-based force accumulation
     energy.ts             kinetic/potential energy for the debug panel
-    merge.ts              collision detection/resolution + compaction
+    merge.ts              merge detection/resolution + compaction (when enabled)
+    collide.ts            elastic-bounce collision response (when merging is disabled)
     spawn.ts              initial placement + angular-momentum setup
     simulation.ts         public facade the simulation worker imports
 src/workers/

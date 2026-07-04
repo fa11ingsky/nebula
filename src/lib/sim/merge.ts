@@ -1,49 +1,11 @@
 // Collision detection/resolution: finding particles close enough (and moving fast
 // enough) to fuse, combining them, and compacting the system afterward.
 import constants from '../constants.ts';
-import { buildQuadtree } from './quadtree.ts';
+import { buildQuadtree, findNearbyParticles } from './quadtree.ts';
 import { copyParticle } from './particleSystem.ts';
 import { getColorForMass } from './colors.ts';
 import { generateSurfaceFeatures } from './surfaceFeatures.ts';
 import { Explosion } from './explosion.ts';
-
-/**
- * Collects every particle index within searchRadius of particle i into `out`, pruning
- * subtrees whose bounding box can't possibly contain a point that close (closest-point-
- * on-box test).
- */
-function findMergeCandidates(system, node, i, searchRadius, out) {
-    if (node.mass === 0) {
-        return;
-    }
-
-    const px = system.posX[i];
-    const py = system.posY[i];
-    const closestX = Math.max(node.x, Math.min(px, node.x + node.size));
-    const closestY = Math.max(node.y, Math.min(py, node.y + node.size));
-    const dx = px - closestX;
-    const dy = py - closestY;
-    if (dx * dx + dy * dy > searchRadius * searchRadius) {
-        return;
-    }
-
-    if (node.children) {
-        for (const child of node.children) {
-            findMergeCandidates(system, child, i, searchRadius, out);
-        }
-        return;
-    }
-
-    if (node.occupant !== -1) {
-        if (node.occupant !== i) {
-            out.push(node.occupant);
-        }
-    } else if (node.bucket) {
-        for (const j of node.bucket) {
-            if (j !== i) out.push(j);
-        }
-    }
-}
 
 /**
  * Combines particle j into particle i in place (i survives and grows; j is left stale
@@ -126,7 +88,7 @@ export function mergeParticles(system, explosions) {
         // for why that's still not enough on its own.
         const speedI = Math.sqrt(system.velX[i] * system.velX[i] + system.velY[i] * system.velY[i]);
         candidates.length = 0;
-        findMergeCandidates(system, tree, i, (system.radius[i] + globalMaxRadius) / 2 + speedI, candidates);
+        findNearbyParticles(tree, system, i, (system.radius[i] + globalMaxRadius) / 2 + speedI, candidates);
 
         for (const j of candidates) {
             if (system.removed[j]) continue;

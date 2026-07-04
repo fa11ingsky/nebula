@@ -22,50 +22,56 @@ export function computeKineticEnergy(system) {
  * exact sum, consistent with the fact that the forces driving this simulation are
  * approximated the same way. Softened the same way as force so a pair well inside the
  * merge threshold doesn't produce a singular energy value.
+ *
+ * Iterative rather than recursive - see gravity.ts's applyTreeGravity for the full
+ * rationale (next-pointer traversal, precomputed thetaSq, multiplication instead of
+ * division in the opening-angle test).
  */
-function accumulatePotentialEnergy(system, i, node) {
-    if (node.mass === 0) {
-        return 0;
-    }
-
-    const dx = node.comX - system.posX[i];
-    const dy = node.comY - system.posY[i];
-    const distSq = dx * dx + dy * dy;
-
-    if (!node.children) {
-        if (node.occupant !== -1) {
-            if (node.occupant === i) {
-                return 0;
-            }
-            const j = node.occupant;
-            const combinedRadius = system.radius[i] + system.radius[j];
-            const softenedDistSq = distSq + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
-            return -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * system.mass[j]) / Math.sqrt(softenedDistSq);
-        }
-        if (node.bucket) {
-            let pe = 0;
-            for (const j of node.bucket) {
-                if (j === i) continue;
-                const odx = system.posX[j] - system.posX[i];
-                const ody = system.posY[j] - system.posY[i];
-                const combinedRadius = system.radius[i] + system.radius[j];
-                const softenedDistSq = odx * odx + ody * ody + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
-                pe += -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * system.mass[j]) / Math.sqrt(softenedDistSq);
-            }
-            return pe;
-        }
-        return 0;
-    }
-
-    if (distSq > 0 && (node.size * node.size) / distSq < constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA) {
-        const softenedDistSq = distSq + system.radius[i] * system.radius[i];
-        return -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * node.mass) / Math.sqrt(softenedDistSq);
-    }
-
+function accumulatePotentialEnergy(system, i, tree, thetaSq) {
+    const px = system.posX[i];
+    const py = system.posY[i];
+    let node = 0;
     let pe = 0;
-    for (const child of node.children) {
-        pe += accumulatePotentialEnergy(system, i, child);
+
+    while (node !== -1) {
+        const mass = tree.mass[node];
+        if (mass === 0) {
+            node = tree.next[node];
+            continue;
+        }
+
+        const dx = tree.comX[node] - px;
+        const dy = tree.comY[node] - py;
+        const distSq = dx * dx + dy * dy;
+
+        if (tree.children[node] === -1) {
+            const occ = tree.occupant[node];
+            if (occ !== -1) {
+                if (occ !== i) {
+                    const combinedRadius = system.radius[i] + system.radius[occ];
+                    const softenedDistSq = distSq + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+                    pe += -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * system.mass[occ]) / Math.sqrt(softenedDistSq);
+                }
+            } else if (tree.bucket[node]) {
+                for (const j of tree.bucket[node]) {
+                    if (j === i) continue;
+                    const odx = system.posX[j] - px;
+                    const ody = system.posY[j] - py;
+                    const combinedRadius = system.radius[i] + system.radius[j];
+                    const softenedDistSq = odx * odx + ody * ody + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+                    pe += -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * system.mass[j]) / Math.sqrt(softenedDistSq);
+                }
+            }
+            node = tree.next[node];
+        } else if (tree.size[node] * tree.size[node] < distSq * thetaSq) {
+            const softenedDistSq = distSq + system.radius[i] * system.radius[i];
+            pe += -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * mass) / Math.sqrt(softenedDistSq);
+            node = tree.next[node];
+        } else {
+            node = tree.children[node];
+        }
     }
+
     return pe;
 }
 
@@ -77,8 +83,9 @@ function accumulatePotentialEnergy(system, i, node) {
  */
 export function computePotentialEnergy(system, tree) {
     let pe = 0;
+    const thetaSq = constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA;
     for (let i = 0; i < system.count; i++) {
-        pe += accumulatePotentialEnergy(system, i, tree);
+        pe += accumulatePotentialEnergy(system, i, tree, thetaSq);
     }
     return pe / 2;
 }

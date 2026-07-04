@@ -68,7 +68,7 @@ export default {
     // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
     // same point - without this, that would try to subdivide forever. Nodes deeper than this
     // just keep a flat list instead of recursing further.
-    QUADTREE_MAX_DEPTH: 24,
+    QUADTREE_MAX_DEPTH: 18,
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,
@@ -105,5 +105,11 @@ export default {
     // closing speed, so each collision bleeds some kinetic energy as "heat" - closer to
     // how real solid material collides, and lets a jostling cluster gradually settle down
     // instead of bouncing at full energy indefinitely.
-    COLLISION_RESTITUTION: 0.5
+    COLLISION_RESTITUTION: 0.1,
+    // Extra gap (in canvas pixels, on top of the two bodies' own radii) that collision
+    // treats as "touching" and enforces as a hard minimum separation - see collide.ts's
+    // resolveOverlap. Purely cosmetic: without it, two bounced circles can render with
+    // their edges exactly coincident (or overlapping by a sub-pixel floating-point
+    // residue), which reads as a visual glitch even though it's numerically correct.
+    COLLISION_SURFACE_GAP: 1
 }

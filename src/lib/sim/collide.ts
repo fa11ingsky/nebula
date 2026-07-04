@@ -2,71 +2,123 @@
 // particles that touch bounce off each other (conserving momentum, and losing some
 // kinetic energy per COLLISION_RESTITUTION) instead of combining into one body.
 import constants from '../constants.ts';
-import { buildQuadtree } from './quadtree.ts';
+import { buildQuadtree, findNearbyParticles } from './quadtree.ts';
 
-/**
- * Collects every particle index within searchRadius of particle i into `out` - the same
- * quadtree range query as merge.ts's findMergeCandidates, kept as its own copy here since
- * merging and colliding are mutually exclusive per-frame behaviors (see simulation.ts)
- * with otherwise little in common.
- */
-function findCollisionCandidates(system, node, i, searchRadius, out) {
-    if (node.mass === 0) {
+// Snapshot of every particle's velocity at the moment this frame's drift actually ran,
+// reused across frames and grown as needed (same pattern as the quadtree's node store) -
+// see collideParticles for why this has to be frozen rather than read live.
+let origVelX = new Float64Array(0);
+let origVelY = new Float64Array(0);
+
+function ensureVelocitySnapshotCapacity(count) {
+    if (count <= origVelX.length) {
         return;
     }
-
-    const px = system.posX[i];
-    const py = system.posY[i];
-    const closestX = Math.max(node.x, Math.min(px, node.x + node.size));
-    const closestY = Math.max(node.y, Math.min(py, node.y + node.size));
-    const dx = px - closestX;
-    const dy = py - closestY;
-    if (dx * dx + dy * dy > searchRadius * searchRadius) {
-        return;
-    }
-
-    if (node.children) {
-        for (const child of node.children) {
-            findCollisionCandidates(system, child, i, searchRadius, out);
-        }
-        return;
-    }
-
-    if (node.occupant !== -1) {
-        if (node.occupant !== i) {
-            out.push(node.occupant);
-        }
-    } else if (node.bucket) {
-        for (const j of node.bucket) {
-            if (j !== i) out.push(j);
-        }
-    }
+    origVelX = new Float64Array(count);
+    origVelY = new Float64Array(count);
 }
 
 /**
- * Pushes two still-overlapping-but-already-separating bodies apart positionally, without
- * touching velocity - resolving a velocity impulse here would add energy instead of
- * removing it, since they're not actually approaching. Mass-weighted (the heavier body
- * moves less) so the pair's combined center of mass doesn't shift.
+ * Softened gravitational potential energy between i and j at the given separation -
+ * matches energy.ts's direct-pair PE formula exactly, so the "energy budget" this
+ * function reasons about is the same quantity the debug panel actually reports.
  */
-function pushApart(system, i, j, weight1, weight2) {
+function softenedPairPE(system, i, j, dist) {
+    const combinedRadius = system.radius[i] + system.radius[j];
+    const softenedDistSq = dist * dist + combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+    return -(constants.GRAVITATIONAL_CONSTANT * system.mass[i] * system.mass[j]) / Math.sqrt(softenedDistSq);
+}
+
+/**
+ * Enforces the hard non-overlap constraint (two particles' surfaces may never
+ * interpenetrate) for a pair found overlapping that isn't already being separated by an
+ * approaching-pair bounce this frame. Separating two gravitationally-bound bodies always
+ * increases their mutual potential energy - moving them apart by fiat, with no
+ * compensating change anywhere else, creates that energy from nothing (this is exactly
+ * the bug an earlier, simpler version of this function had: proven, via an isolated
+ * test, to inject energy on every call). Instead, this pays for the PE increase by
+ * removing exactly that much kinetic energy from the pair's own relative motion along
+ * the separation normal, via the same impulse mechanics as resolveImpulse - so the
+ * position change is never free.
+ *
+ * If the pair doesn't have enough of *that specific* energy (relative velocity along the
+ * normal) to afford separating all the way out to touchDistance, this separates them as
+ * far as the available budget actually pays for and no further - a pair truly at rest
+ * relative to each other while overlapping can't be pulled apart without inventing
+ * energy, so it's left slightly overlapping for this frame (gravity's very next kick
+ * will pull them into a real, energy-accounted approach/bounce next frame instead).
+ */
+function resolveOverlap(system, i, j) {
     const dx = system.posX[j] - system.posX[i];
     const dy = system.posY[j] - system.posY[i];
-    const touchDistance = system.radius[i] + system.radius[j];
-    const distSq = dx * dx + dy * dy;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1e-6;
+    const touchDistance = system.radius[i] + system.radius[j] + constants.COLLISION_SURFACE_GAP;
 
-    if (distSq >= touchDistance * touchDistance || distSq < 1e-12) {
-        return; // not actually overlapping right now, or exactly coincident - nothing to push apart
+    if (dist >= touchDistance) {
+        return; // not actually overlapping - nothing to do
     }
 
-    const dist = Math.sqrt(distSq);
-    const correction = touchDistance / dist - 1; // scales (dx,dy) up to exactly touchDistance apart
-    const pushX = dx * correction;
-    const pushY = dy * correction;
-    system.posX[i] -= weight1 * pushX;
-    system.posY[i] -= weight1 * pushY;
-    system.posX[j] += weight2 * pushX;
-    system.posY[j] += weight2 * pushY;
+    const nx = dx / dist;
+    const ny = dy / dist;
+
+    const m1 = system.mass[i];
+    const m2 = system.mass[j];
+    const mu = 1 / (1 / m1 + 1 / m2); // reduced mass
+
+    const relVx = system.velX[i] - system.velX[j];
+    const relVy = system.velY[i] - system.velY[j];
+    const vn = relVx * nx + relVy * ny; // relative speed along the normal (i toward j is positive)
+
+    const availableEnergy = 0.5 * mu * vn * vn;
+    const fullSeparationCost = softenedPairPE(system, i, j, touchDistance) - softenedPairPE(system, i, j, dist);
+
+    let targetDist;
+    if (availableEnergy >= fullSeparationCost) {
+        targetDist = touchDistance;
+    } else {
+        // Solve for the largest r1 the available budget actually affords: softenedPairPE
+        // is monotonically increasing in distance, so this has exactly one solution.
+        const combinedRadius = system.radius[i] + system.radius[j];
+        const softeningSq = combinedRadius * combinedRadius * constants.GRAVITY_SOFTENING_FACTOR;
+        const gm1m2 = constants.GRAVITATIONAL_CONSTANT * m1 * m2;
+        const invSqrtR0 = 1 / Math.sqrt(dist * dist + softeningSq);
+        const k = invSqrtR0 - availableEnergy / gm1m2;
+        if (k <= 0) {
+            targetDist = touchDistance; // budget covers even more than the full gap - cap there anyway
+        } else {
+            targetDist = Math.sqrt(Math.max(1 / (k * k) - softeningSq, 0));
+        }
+    }
+
+    if (targetDist <= dist) {
+        return; // no relative motion along the normal to spend - can't afford any separation right now
+    }
+
+    // Move the pair apart along the normal, mass-weighted so the heavier body moves less
+    // and their combined center of mass doesn't shift.
+    const weight1 = m2 / (m1 + m2);
+    const weight2 = m1 / (m1 + m2);
+    const shift = targetDist - dist;
+    system.posX[i] -= weight1 * shift * nx;
+    system.posY[i] -= weight1 * shift * ny;
+    system.posX[j] += weight2 * shift * nx;
+    system.posY[j] += weight2 * shift * ny;
+
+    // Pay for exactly the potential energy just spent by removing that much kinetic
+    // energy from the pair's relative motion along the normal - same quadratic as
+    // resolveImpulse's restitution formula, just solved for "cancel this specific energy
+    // cost" instead of "reverse this fraction of the closing speed". Keeps the same sign
+    // of relative motion (just slower), rather than flipping it, since a positional
+    // correction "braking" a separation is the physically sensible direction.
+    const spentEnergy = softenedPairPE(system, i, j, targetDist) - softenedPairPE(system, i, j, dist);
+    const discriminant = Math.max(vn * vn - (2 * spentEnergy) / mu, 0);
+    const vnNew = Math.sign(vn) * Math.sqrt(discriminant);
+    const impulse = mu * (vn - vnNew);
+
+    system.velX[i] -= (impulse / m1) * nx;
+    system.velY[i] -= (impulse / m1) * ny;
+    system.velX[j] += (impulse / m2) * nx;
+    system.velY[j] += (impulse / m2) * ny;
 }
 
 /**
@@ -137,10 +189,26 @@ function resolveImpulse(system, i, j, nx, ny, remainingT) {
  * separation first reaches the touch distance, while the two are still actually
  * approaching - via the standard sphere-sweep quadratic: |P0 + tV|^2 = touchDistance^2,
  * solved for the smallest valid root in [0,1].
+ *
+ * The swept reconstruction (relative velocity, and the pre-drift position derived from
+ * it) always reads a snapshot of every velocity taken at entry, never system.velX/velY
+ * live - a particle already bounced earlier in this same pass has a *different* current
+ * velocity than the one that actually produced this frame's drift, and reconstructing
+ * "where was it before this frame" from the wrong velocity gives the wrong answer,
+ * silently missing collisions that really happened. resolveImpulse itself still reads
+ * live velocities, since the bounce itself should correctly account for an earlier
+ * bounce this same frame (standard sequential impulse resolution) - only the geometry
+ * reconstruction needs the frozen snapshot.
  */
 export function collideParticles(system) {
     const tree = buildQuadtree(system);
     const count = system.count;
+
+    ensureVelocitySnapshotCapacity(count);
+    for (let i = 0; i < count; i++) {
+        origVelX[i] = system.velX[i];
+        origVelY[i] = system.velY[i];
+    }
 
     // Upper bound on how far apart two particles could possibly be and still touch,
     // so the range query never misses a legitimate candidate - see merge.ts's identical
@@ -160,9 +228,9 @@ export function collideParticles(system) {
     const resolvedPairs = new Set();
 
     for (let i = 0; i < count; i++) {
-        const speedI = Math.sqrt(system.velX[i] * system.velX[i] + system.velY[i] * system.velY[i]);
+        const speedI = Math.sqrt(origVelX[i] * origVelX[i] + origVelY[i] * origVelY[i]);
         candidates.length = 0;
-        findCollisionCandidates(system, tree, i, system.radius[i] + globalMaxRadius + speedI, candidates);
+        findNearbyParticles(tree, system, i, system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI, candidates);
 
         for (const j of candidates) {
             const pairKey = i < j ? i * system.capacity + j : j * system.capacity + i;
@@ -170,8 +238,8 @@ export function collideParticles(system) {
                 continue;
             }
 
-            const relVx = system.velX[j] - system.velX[i]; // V, "j relative to i"
-            const relVy = system.velY[j] - system.velY[i];
+            const relVx = origVelX[j] - origVelX[i]; // V, "j relative to i"
+            const relVy = origVelY[j] - origVelY[i];
             const relSpeedSq = relVx * relVx + relVy * relVy; // a
 
             const endDx = system.posX[j] - system.posX[i];
@@ -183,7 +251,7 @@ export function collideParticles(system) {
             const startDx = endDx - relVx; // P0
             const startDy = endDy - relVy;
 
-            const touchDistance = system.radius[i] + system.radius[j];
+            const touchDistance = system.radius[i] + system.radius[j] + constants.COLLISION_SURFACE_GAP;
             const c = startDx * startDx + startDy * startDy - touchDistance * touchDistance;
 
             let t; // fraction of this frame's drift at which contact occurred
@@ -217,11 +285,6 @@ export function collideParticles(system) {
                 contactDy = startDy + t * relVy;
             }
 
-            const m1 = system.mass[i];
-            const m2 = system.mass[j];
-            const weight1 = m2 / (m1 + m2); // how much of a positional correction body i absorbs
-            const weight2 = m1 / (m1 + m2); // ...and body j - heavier body moves less
-
             // closingSpeed<0 means approaching (contactDx/Dy and relVx/Vy are both in the
             // "j relative to i" convention, so this is d.v in that convention - negative
             // exactly when the separation is shrinking).
@@ -229,10 +292,12 @@ export function collideParticles(system) {
 
             if (closingSpeed >= 0) {
                 // Already moving apart (or exactly tangential) at the moment contact began -
-                // if drift still carried them through each other despite that, just push
-                // them apart positionally; a velocity impulse here would add energy rather
-                // than remove it.
-                pushApart(system, i, j, weight1, weight2);
+                // no bounce needed (their own velocity is already carrying them apart), but
+                // if they're still currently overlapping regardless, the non-overlap
+                // constraint still has to be enforced - see resolveOverlap for why that
+                // can't just be a positional shove (that was an earlier, buggy version of
+                // this function, proven to inject energy from nothing every time it ran).
+                resolveOverlap(system, i, j);
                 resolvedPairs.add(pairKey);
                 continue;
             }
@@ -242,6 +307,12 @@ export function collideParticles(system) {
             const ny = contactDy / dist;
 
             resolveImpulse(system, i, j, nx, ny, 1 - t);
+            // Belt-and-suspenders: resolveImpulse's post-bounce position advancement
+            // should already put them at or past touchDistance, but only covers the
+            // remaining fraction of this frame's drift - if that fraction was too small
+            // to fully clear the overlap, enforce the constraint directly rather than
+            // letting a sliver of penetration carry into the next frame.
+            resolveOverlap(system, i, j);
             resolvedPairs.add(pairKey);
         }
     }

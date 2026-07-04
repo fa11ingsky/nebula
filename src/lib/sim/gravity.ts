@@ -40,6 +40,15 @@ function applyAggregateGravity(system, i, otherMass, dx, dy, distSq) {
  * opening-angle test), the whole subtree is treated as one point mass instead of
  * descending into it - O(log n) node visits per particle instead of O(n).
  *
+ * Iterative rather than recursive: `tree`'s next-pointers (see quadtree.ts) let this walk
+ * the whole traversal as a single flat loop - skip a subtree (it's a leaf, or approved for
+ * aggregation) by jumping to `next`; otherwise descend into `children`. thetaSq is passed
+ * in already squared and precomputed once per computeGravity() call rather than
+ * recomputed on every node visit, and the opening-angle test is written as a
+ * multiplication (`size^2 < distSq*thetaSq`) instead of a division - cheaper, and (unlike
+ * the division form) doesn't need a separate distSq>0 guard, since size^2 is always
+ * positive and distSq=0 correctly fails the test either way, forcing a descend.
+ *
  * On momentum conservation: every particle runs this traversal independently, and only
  * ever updates its OWN acceleration (never anyone else's). For two individual particles
  * resolved down to actual leaves, both sides independently compute the same physics from
@@ -51,39 +60,43 @@ function applyAggregateGravity(system, i, otherMass, dx, dy, distSq) {
  * accuracy/speed trade this algorithm makes - total momentum is very close to conserved,
  * not exact to the bit, in exchange for going from O(n^2) to O(n log n).
  */
-function applyTreeGravity(system, i, node) {
-    if (node.mass === 0) {
-        return;
-    }
+function applyTreeGravity(system, i, tree, thetaSq) {
+    const px = system.posX[i];
+    const py = system.posY[i];
+    let node = 0;
 
-    const dx = node.comX - system.posX[i];
-    const dy = node.comY - system.posY[i];
-    const distSq = dx * dx + dy * dy;
-
-    if (!node.children) {
-        if (node.occupant !== -1) {
-            if (node.occupant !== i) {
-                applyDirectGravity(system, i, node.occupant, dx, dy, distSq);
-            }
-        } else if (node.bucket) {
-            for (const j of node.bucket) {
-                if (j === i) continue;
-                const odx = system.posX[j] - system.posX[i];
-                const ody = system.posY[j] - system.posY[i];
-                applyDirectGravity(system, i, j, odx, ody, odx * odx + ody * ody);
-            }
+    while (node !== -1) {
+        const mass = tree.mass[node];
+        if (mass === 0) {
+            node = tree.next[node];
+            continue;
         }
-        return;
-    }
 
-    // Opening-angle test: (size/distance)^2 < theta^2 -> approximate; otherwise descend.
-    if (distSq > 0 && (node.size * node.size) / distSq < constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA) {
-        applyAggregateGravity(system, i, node.mass, dx, dy, distSq);
-        return;
-    }
+        const dx = tree.comX[node] - px;
+        const dy = tree.comY[node] - py;
+        const distSq = dx * dx + dy * dy;
 
-    for (const child of node.children) {
-        applyTreeGravity(system, i, child);
+        if (tree.children[node] === -1) {
+            const occ = tree.occupant[node];
+            if (occ !== -1) {
+                if (occ !== i) {
+                    applyDirectGravity(system, i, occ, dx, dy, distSq);
+                }
+            } else if (tree.bucket[node]) {
+                for (const j of tree.bucket[node]) {
+                    if (j === i) continue;
+                    const odx = system.posX[j] - px;
+                    const ody = system.posY[j] - py;
+                    applyDirectGravity(system, i, j, odx, ody, odx * odx + ody * ody);
+                }
+            }
+            node = tree.next[node];
+        } else if (tree.size[node] * tree.size[node] < distSq * thetaSq) {
+            applyAggregateGravity(system, i, mass, dx, dy, distSq);
+            node = tree.next[node];
+        } else {
+            node = tree.children[node];
+        }
     }
 }
 
@@ -99,8 +112,9 @@ function applyTreeGravity(system, i, node) {
  */
 export function computeGravity(system, tree) {
     const gravityTree = tree || buildQuadtree(system);
+    const thetaSq = constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA;
     for (let i = 0; i < system.count; i++) {
-        applyTreeGravity(system, i, gravityTree);
+        applyTreeGravity(system, i, gravityTree, thetaSq);
     }
     return gravityTree;
 }
