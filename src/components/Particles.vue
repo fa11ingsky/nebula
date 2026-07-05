@@ -211,7 +211,18 @@
                 await this.bgSketchReady;
                 const graphics = createNebulaBackground(this.bgSketch, width, height);
                 const bitmap = await createImageBitmap(graphics.canvas);
-                graphics.remove();
+                // Deliberately not graphics.remove() - that calls into p5.Element.prototype's
+                // internal bookkeeping (this._pInst._elements.indexOf(this)), which threw on
+                // deployment (undefined _elements) for reasons that didn't reproduce from
+                // reading p5's source directly. Detaching the canvas node ourselves achieves
+                // the same practical goal (this offscreen buffer doesn't linger in the DOM)
+                // without depending on p5 internals that turned out not to be reliable here.
+                // bgSketch's own _elements array is left with a stale reference to this
+                // graphics object - harmless: generateBackgroundBitmap only runs a handful of
+                // times per session (startup, resize, settings changes), not per frame.
+                if (graphics.canvas.parentNode) {
+                    graphics.canvas.parentNode.removeChild(graphics.canvas);
+                }
                 return bitmap;
             },
 
