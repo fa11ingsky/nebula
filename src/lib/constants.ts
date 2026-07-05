@@ -114,5 +114,5 @@ export default {
     // resolveOverlap. Purely cosmetic: without it, two bounced circles can render with
     // their edges exactly coincident (or overlapping by a sub-pixel floating-point
     // residue), which reads as a visual glitch even though it's numerically correct.
-    COLLISION_SURFACE_GAP: 1
+    COLLISION_SURFACE_GAP: 2
 }
