@@ -24,8 +24,23 @@
 // by the small `p5Shim` object below, which implements just that handful of methods
 // against a raw CanvasRenderingContext2D - see particleRender.ts/spawn.ts for the exact
 // calls it needs to satisfy.
+//
+// Two rendering backends: the default Canvas2D path (full textured look, via p5Shim +
+// particleRender.ts) and an optional WebGPU path (see webgpuRenderer.ts - flat-colored
+// circles only, but drawn via one instanced GPU draw call for the whole swarm instead of
+// per-particle Canvas2D calls). A <canvas> can only ever be given ONE context type for
+// its lifetime, so switching backends means the main thread hands over a brand new
+// OffscreenCanvas (see the 'switchRenderer' case) rather than this worker reconfiguring
+// its existing one.
 import constants from '../lib/constants.ts';
 import * as simulation from '../lib/sim/simulation.ts';
+import { createWebGPURenderer, resizeWebGPURenderer, setWebGPUBackground, renderWebGPUFrame, destroyWebGPURenderer } from '../lib/sim/webgpuRenderer.ts';
+import { initGravityWasm } from '../lib/sim/gravity.ts';
+
+// Fire-and-forget: gravity.ts's computeGravity checks readiness itself and transparently
+// runs the plain JS Barnes-Hut path until this resolves, so nothing here needs to await it
+// - worst case, the first frame or two of a session use JS gravity instead of WASM.
+initGravityWasm();
 
 let canvas = null;
 let ctx = null;
@@ -42,6 +57,14 @@ let crosshairVisible = false;
 let explosionsEnabled = false;
 let debugPanelVisible = false;
 
+// 'canvas2d' (default) or 'webgpu' - see the module header comment above.
+let renderBackend = 'canvas2d';
+let gpuRenderer = null;
+// False during an async backend switch (WebGPU device/pipeline setup isn't
+// instantaneous) - tick() keeps stepping physics regardless, just skips drawing until
+// the new backend is actually ready, rather than drawing to a half-initialized one.
+let rendererReady = true;
+
 let tickHandle = null;
 let lastTickTime = 0;
 let smoothedFps = 0;
@@ -52,7 +75,8 @@ let smoothedFps = 0;
  * ellipse/width/height) - see particleRender.ts and spawn.ts. Letting those modules run
  * completely unmodified here (rather than forking a worker-specific copy of the
  * rendering code) means there's exactly one implementation of "how a body is drawn" to
- * keep correct, on the main thread or in this worker.
+ * keep correct, on the main thread or in this worker. Only used for the Canvas2D backend
+ * - the WebGPU backend never touches p5Shim or particleRender.ts at all.
  */
 const p5Shim = {
     width: 0,
@@ -81,9 +105,55 @@ const p5Shim = {
 
 function resetSim() {
     explosions = [];
-    const spawned = simulation.spawnParticles(p5Shim, centralMassEnabled);
+    const spawned = simulation.spawnParticles(p5Shim, centralMassEnabled, mergingEnabled);
     state = spawned.state;
     worldCenter = spawned.worldCenter;
+}
+
+function renderFrame(com, offsetX, offsetY) {
+    if (renderBackend === 'webgpu') {
+        if (!rendererReady || !gpuRenderer) {
+            return; // mid-switch - keep stepping physics, just don't draw yet
+        }
+        renderWebGPUFrame(
+            gpuRenderer,
+            state,
+            explosions,
+            { offsetX, offsetY, comX: com.x, comY: com.y },
+            crosshairVisible
+        );
+        return;
+    }
+
+    if (backgroundBitmap) {
+        ctx.drawImage(backgroundBitmap, 0, 0);
+    } else {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+
+    simulation.displayAll(p5Shim, state, texturesEnabled);
+
+    for (const explosion of explosions) {
+        explosion.display(p5Shim);
+    }
+
+    // Marks the center of mass - should render pinned to the middle of the screen every
+    // frame, since the camera is centered on it.
+    if (crosshairVisible) {
+        ctx.strokeStyle = 'rgb(255, 255, 255)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(com.x - 8, com.y);
+        ctx.lineTo(com.x + 8, com.y);
+        ctx.moveTo(com.x, com.y - 8);
+        ctx.lineTo(com.x, com.y + 8);
+        ctx.stroke();
+    }
+
+    ctx.restore();
 }
 
 function tick() {
@@ -98,12 +168,6 @@ function tick() {
         }
         lastTickTime = now;
         p5Shim.frameCount++;
-
-        if (backgroundBitmap) {
-            ctx.drawImage(backgroundBitmap, 0, 0);
-        } else {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-        }
 
         // One full leapfrog step (kick-drift-kick + merge detection + gravity) - see
         // simulation.ts's stepSimulation.
@@ -134,38 +198,14 @@ function tick() {
         const offsetX = canvas.width / 2 - com.x;
         const offsetY = canvas.height / 2 - com.y;
 
-        ctx.save();
-        ctx.translate(offsetX, offsetY);
-
-        simulation.displayAll(p5Shim, state, texturesEnabled);
-
-        for (const explosion of explosions) {
-            explosion.display(p5Shim);
-        }
-
-        // Marks the center of mass - should render pinned to the middle of the screen
-        // every frame, since the camera is centered on it.
-        if (crosshairVisible) {
-            ctx.strokeStyle = 'rgb(255, 255, 255)';
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            ctx.moveTo(com.x - 8, com.y);
-            ctx.lineTo(com.x + 8, com.y);
-            ctx.moveTo(com.x, com.y - 8);
-            ctx.lineTo(com.x, com.y + 8);
-            ctx.stroke();
-        }
-
-        ctx.restore();
-
         if (debugPanelVisible) {
+            // Relative to the FIXED spawn-time world center, not the live canvas
+            // dimensions the camera uses - reusing the camera's offset here was the
+            // original bug this measurement had to avoid: resizing the window changes
+            // canvas.width/height, which would silently redefine "center" for this
+            // reading with no particle having actually moved, masquerading as huge drift.
             postMessage({
                 type: 'stats',
-                // Relative to the FIXED spawn-time world center, not the live canvas
-                // dimensions the camera uses - reusing the camera's offset here was the
-                // original bug this measurement had to avoid: resizing the window changes
-                // canvas.width/height, which would silently redefine "center" for this
-                // reading with no particle having actually moved, masquerading as huge drift.
                 centerOfMass: { x: com.x - worldCenter.x, y: com.y - worldCenter.y },
                 // Reuses the tree gravity already built this frame rather than a third
                 // rebuild just for this readout.
@@ -174,6 +214,8 @@ function tick() {
                 fps: smoothedFps,
             });
         }
+
+        renderFrame(com, offsetX, offsetY);
     }
 
     // Workers have no requestAnimationFrame (it's tied to the window's render pipeline,
@@ -185,6 +227,41 @@ function tick() {
     // frames (a synchronous infinite loop would starve them - settings changes and
     // stop/resume would never be able to get through).
     tickHandle = setTimeout(tick, 16);
+}
+
+async function switchToWebGPU(newCanvas, bitmap) {
+    rendererReady = false;
+    const renderer = await createWebGPURenderer(newCanvas);
+    if (!renderer) {
+        // Shouldn't normally happen (Particles.vue only offers this path after its own
+        // support check succeeds), but if the device/pipeline chain fails anyway, report
+        // it so the main thread can fall back rather than leaving rendering stuck.
+        postMessage({ type: 'rendererSwitchFailed', backend: 'webgpu' });
+        rendererReady = true;
+        return;
+    }
+    canvas = newCanvas;
+    gpuRenderer = renderer;
+    if (bitmap) {
+        setWebGPUBackground(gpuRenderer, bitmap);
+        bitmap.close();
+    }
+    renderBackend = 'webgpu';
+    rendererReady = true;
+}
+
+function switchToCanvas2D(newCanvas, bitmap) {
+    canvas = newCanvas;
+    ctx = canvas.getContext('2d');
+    p5Shim.drawingContext = ctx;
+    p5Shim.width = canvas.width;
+    p5Shim.height = canvas.height;
+    if (backgroundBitmap) {
+        backgroundBitmap.close();
+    }
+    backgroundBitmap = bitmap;
+    renderBackend = 'canvas2d';
+    rendererReady = true;
 }
 
 self.onmessage = (event) => {
@@ -218,14 +295,39 @@ self.onmessage = (event) => {
             // been transferred - the main thread can still resize the visible element's
             // CSS display size, but the buffer itself (canvas.width/height) is exclusively
             // ours now.
-            canvas.width = msg.width;
-            canvas.height = msg.height;
+            if (renderBackend === 'webgpu' && gpuRenderer) {
+                resizeWebGPURenderer(gpuRenderer, msg.width, msg.height);
+                if (msg.backgroundBitmap) {
+                    setWebGPUBackground(gpuRenderer, msg.backgroundBitmap);
+                    msg.backgroundBitmap.close();
+                }
+            } else {
+                canvas.width = msg.width;
+                canvas.height = msg.height;
+                if (backgroundBitmap) {
+                    backgroundBitmap.close();
+                }
+                backgroundBitmap = msg.backgroundBitmap;
+            }
             p5Shim.width = msg.width;
             p5Shim.height = msg.height;
-            if (backgroundBitmap) {
-                backgroundBitmap.close();
+            break;
+        }
+
+        case 'switchRenderer': {
+            // Old canvas (whichever backend it belonged to) is simply dropped - Canvas2D
+            // needs no explicit teardown, and an OffscreenCanvas that still has a WebGPU
+            // context alive would otherwise leak GPU resources, so that case is cleaned
+            // up explicitly.
+            if (renderBackend === 'webgpu' && gpuRenderer) {
+                destroyWebGPURenderer(gpuRenderer);
+                gpuRenderer = null;
             }
-            backgroundBitmap = msg.backgroundBitmap;
+            if (msg.backend === 'webgpu') {
+                switchToWebGPU(msg.canvas, msg.backgroundBitmap);
+            } else {
+                switchToCanvas2D(msg.canvas, msg.backgroundBitmap);
+            }
             break;
         }
 
@@ -237,6 +339,12 @@ self.onmessage = (event) => {
 
         case 'setMergingEnabled': {
             mergingEnabled = msg.value;
+            // Recolors in place rather than waiting for the next Restart - see
+            // particleSystem.ts's recolorAll for why color otherwise wouldn't reflect the
+            // new mode until then.
+            if (state) {
+                simulation.recolorAll(state, mergingEnabled);
+            }
             break;
         }
 
