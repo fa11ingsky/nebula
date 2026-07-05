@@ -150,7 +150,7 @@ function computeGravityWasm(system) {
     heap.set(system.mass.subarray(0, count), wasmMassOffset);
     heap.set(system.radius.subarray(0, count), wasmRadiusOffset);
 
-    wasmModule._compute_gravity(count, constants.GRAVITATIONAL_CONSTANT, constants.GRAVITY_SOFTENING_FACTOR, constants.BARNES_HUT_THETA, constants.QUADTREE_MAX_DEPTH, constants.QUADTREE_LEAF_CAPACITY);
+    wasmModule._compute_gravity(count, constants.GRAVITATIONAL_CONSTANT, constants.GRAVITY_SOFTENING_FACTOR, constants.BARNES_HUT_THETA, constants.QUADTREE_MAX_DEPTH, constants.QUADTREE_LEAF_CAPACITY, constants.GRAVITY_MAX_THREADS);
 
     const outAccX = heap.subarray(wasmAccXOffset, wasmAccXOffset + count);
     const outAccY = heap.subarray(wasmAccYOffset, wasmAccYOffset + count);

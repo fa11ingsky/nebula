@@ -491,7 +491,7 @@ EMSCRIPTEN_KEEPALIVE int get_max_candidates() { return MAX_CANDIDATES; }
 // acceleration array instead (see gravity.ts). Silently does nothing if count exceeds this
 // module's fixed capacity - the caller is expected to check get_max_particles() first and
 // fall back to the JS implementation rather than ever hitting this.
-EMSCRIPTEN_KEEPALIVE void compute_gravity(int count, float G, float softeningFactor, float theta, int quadtreeMaxDepth, int leafCapacity) {
+EMSCRIPTEN_KEEPALIVE void compute_gravity(int count, float G, float softeningFactor, float theta, int quadtreeMaxDepth, int leafCapacity, int maxThreads) {
     if (count < 0 || count > MAX_PARTICLES) {
         return;
     }
@@ -521,8 +521,19 @@ EMSCRIPTEN_KEEPALIVE void compute_gravity(int count, float G, float softeningFac
     // sequential pass. That's what lets gravity.cpp itself stay identical between the two
     // builds - whether this actually runs in parallel is entirely a compile-flag / runtime
     // (crossOriginIsolated) question, never a code-path branch here.
+    //
+    // maxThreads (constants.ts's GRAVITY_MAX_THREADS) is a user-tunable ceiling on top of
+    // hardware_concurrency(), not a replacement for it - std::min below still never spawns
+    // more threads than the browser reports logical cores for. Requesting more threads than
+    // there are cores doesn't add throughput (there's no more CPU to schedule them onto),
+    // it only adds cost: every thread here is spawned fresh and joined every single
+    // compute_gravity call - i.e. up to 60 times a second - so oversubscribing relative to
+    // real hardware just means paying that spawn/join overhead for threads that end up
+    // time-slicing against each other on the same cores, doing the same total work slower
+    // than fewer, fully-scheduled threads would have.
     unsigned int hwThreads = std::thread::hardware_concurrency();
-    int32_t threadCount = hwThreads < 1 ? 1 : (int32_t)std::min(hwThreads, 16u);
+    int32_t threadCap = maxThreads < 1 ? 1 : maxThreads;
+    int32_t threadCount = hwThreads < 1 ? 1 : (int32_t)std::min(hwThreads, (unsigned int)threadCap);
     if (threadCount > count) {
         threadCount = count > 0 ? count : 1;
     }

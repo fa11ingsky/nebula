@@ -157,15 +157,29 @@
             // owned by the worker via OffscreenCanvas, so nothing here ever calls
             // createCanvas()/draw() on this instance.
             this.bgSketch = null;
+            // Resolves once bgSketch's setup() has actually run - p5's constructor defers
+            // its real internal initialization (which sets up this._elements, among other
+            // things) until the window's 'load' event UNLESS document.readyState is already
+            // 'complete' at construction time, so bgSketch can't safely be touched right
+            // after `new p5(...)` returns. Skipping this wait used to work often enough not
+            // to notice, but isn't reliable - it depends on exactly how fast the rest of the
+            // page happens to load, and calling createGraphics()/remove() on a p5 instance
+            // before its own setup has fired throws deep inside p5 (_pInst._elements is
+            // still undefined). generateBackgroundBitmap awaits this before touching
+            // bgSketch at all, on every call, not just the first.
+            this.bgSketchReady = null;
             this.resizeTimer = null;
         },
 
         mounted() {
-            this.bgSketch = new p5((sketch) => {
-                sketch.setup = () => {
-                    sketch.noCanvas();
-                    sketch.noLoop();
-                };
+            this.bgSketchReady = new Promise((resolve) => {
+                this.bgSketch = new p5((sketch) => {
+                    sketch.setup = () => {
+                        sketch.noCanvas();
+                        sketch.noLoop();
+                        resolve();
+                    };
+                });
             });
 
             this.startSimulation();
@@ -180,7 +194,10 @@
             window.removeEventListener('resize', this.handleResize);
             clearTimeout(this.resizeTimer);
             this.worker?.terminate();
-            this.bgSketch?.remove();
+            // Same readiness wait as generateBackgroundBitmap - unmounting before bgSketch's
+            // setup() has fired (a fast enough navigate-away) would otherwise hit the same
+            // p5-internals-not-ready crash this.bgSketchReady exists to prevent.
+            this.bgSketchReady?.then(() => this.bgSketch?.remove());
         },
 
         methods: {
@@ -191,6 +208,7 @@
              * hot path since it only happens at startup and on resize, not every frame.
              */
             async generateBackgroundBitmap(width, height) {
+                await this.bgSketchReady;
                 const graphics = createNebulaBackground(this.bgSketch, width, height);
                 const bitmap = await createImageBitmap(graphics.canvas);
                 graphics.remove();

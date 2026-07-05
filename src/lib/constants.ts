@@ -1,7 +1,7 @@
 export default {
     // Shown in the debug panel - bump manually as a quick way to tell, at a glance,
     // whether a deployed build actually picked up recent changes.
-    VERSION: '0.1.3',
+    VERSION: '0.1.4',
     MAX_MASS: 500,
     // Six-stop gradient a particle sweeps through as it gains mass, smallest to heaviest.
     COLORS: {
@@ -68,6 +68,17 @@ export default {
     // sooner) - worth raising as particle count climbs into the tens of thousands.
     BARNES_HUT_THETA: 0.5,
     BARNES_HUT_THETA_OPTIONS: [0.3, 0.5, 0.8, 1.2, 3],
+    // WASM-only (see src/wasm/gravity.cpp's compute_gravity): ceiling on how many
+    // std::thread workers the threaded WASM build spawns for gravity's per-particle force
+    // loop, on TOP of the browser's own navigator.hardwareConcurrency (this never spawns
+    // more threads than the browser reports logical cores for, regardless of how high this
+    // is set). Raising this past your actual core count won't add throughput - there's no
+    // more CPU to schedule extra threads onto - it only adds cost, since every thread here
+    // is spawned fresh and joined again up to 60 times a second; oversubscribing just means
+    // paying that spawn/join overhead for threads that end up time-slicing against each
+    // other on the same cores. Has no effect at all on the non-threaded WASM build (always
+    // runs sequentially there) or when the page isn't cross-origin isolated.
+    GRAVITY_MAX_THREADS: 16,
     // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
     // same point - without this, that would try to subdivide forever. Nodes deeper than this
     // just keep a flat list instead of recursing further.
