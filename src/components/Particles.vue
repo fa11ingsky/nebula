@@ -2,6 +2,7 @@
     <div class="simulation">
         <canvas ref="canvas"></canvas>
         <div class="debug-panel" v-if="debugPanelVisible">
+            <div>v{{ version }}</div>
             <div class="debug-title">Performance</div>
             <div>fps: {{ fps.toFixed(1) }}</div>
             <div class="debug-title">Center of Mass</div>
@@ -86,6 +87,7 @@
     export default {
         data() {
             return {
+                version: constants.VERSION,
                 stopped: false,
                 centralMassEnabled: false,
                 // With merging off (the default), colliding bodies bounce off each other
