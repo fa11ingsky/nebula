@@ -2,20 +2,20 @@
 // particles that touch bounce off each other (conserving momentum, and losing some
 // kinetic energy per COLLISION_RESTITUTION) instead of combining into one body.
 import constants from '../constants.ts';
-import { buildQuadtree, findNearbyParticles } from './quadtree.ts';
+import { buildSpatialGrid, findNearbyInGrid } from './spatialGrid.ts';
 
 // Snapshot of every particle's velocity at the moment this frame's drift actually ran,
 // reused across frames and grown as needed (same pattern as the quadtree's node store) -
 // see collideParticles for why this has to be frozen rather than read live.
-let origVelX = new Float64Array(0);
-let origVelY = new Float64Array(0);
+let origVelX = new Float32Array(0);
+let origVelY = new Float32Array(0);
 
 function ensureVelocitySnapshotCapacity(count) {
     if (count <= origVelX.length) {
         return;
     }
-    origVelX = new Float64Array(count);
-    origVelY = new Float64Array(count);
+    origVelX = new Float32Array(count);
+    origVelY = new Float32Array(count);
 }
 
 /**
@@ -199,9 +199,17 @@ function resolveImpulse(system, i, j, nx, ny, remainingT) {
  * live velocities, since the bounce itself should correctly account for an earlier
  * bounce this same frame (standard sequential impulse resolution) - only the geometry
  * reconstruction needs the frozen snapshot.
+ *
+ * Candidate lookup uses a uniform spatial grid (spatialGrid.ts) rather than the
+ * Barnes-Hut quadtree gravity relies on - collision only ever needs "particles within
+ * roughly one particle's width," a bounded-radius query the grid answers in a handful of
+ * direct cell lookups, versus the tree's O(log n) recursive descent with pruning tests
+ * paying for hierarchy this query doesn't need. It also means gravity's own tree (built
+ * fresh right after this function returns) is the only quadtree built per frame in
+ * collision mode, instead of the two it used to take.
  */
 export function collideParticles(system) {
-    const tree = buildQuadtree(system);
+    const grid = buildSpatialGrid(system);
     const count = system.count;
 
     ensureVelocitySnapshotCapacity(count);
@@ -230,7 +238,7 @@ export function collideParticles(system) {
     for (let i = 0; i < count; i++) {
         const speedI = Math.sqrt(origVelX[i] * origVelX[i] + origVelY[i] * origVelY[i]);
         candidates.length = 0;
-        findNearbyParticles(tree, system, i, system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI, candidates);
+        findNearbyInGrid(grid, system, i, system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI, candidates);
 
         for (const j of candidates) {
             const pairKey = i < j ? i * system.capacity + j : j * system.capacity + i;

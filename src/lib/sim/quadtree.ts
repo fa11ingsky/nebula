@@ -1,5 +1,6 @@
 // Barnes-Hut quadtree: spatial index used by both gravity.ts (force approximation) and
-// merge.ts/collide.ts (nearby-particle range queries via findNearbyParticles).
+// merge.ts (nearby-particle range queries via findNearbyParticles). collide.ts uses its
+// own uniform spatial grid (spatialGrid.ts) instead - see that file for why.
 //
 // Nodes live in flat, parallel typed arrays (a struct-of-arrays "store") rather than as
 // individually-allocated, pooled JS objects each holding an array of 4 child references.
@@ -37,9 +38,9 @@ function createStore(capacity) {
         capacity,
         count: 0,
         // Node geometry: (x, y) is the top-left corner, size is the full width/height.
-        x: new Float64Array(capacity),
-        y: new Float64Array(capacity),
-        size: new Float64Array(capacity),
+        x: new Float32Array(capacity),
+        y: new Float32Array(capacity),
+        size: new Float32Array(capacity),
         // Index of the first of 4 contiguous children, or -1 if this node hasn't been
         // subdivided (it may still hold a single occupant or a depth-capped bucket).
         children: new Int32Array(capacity),
@@ -53,9 +54,9 @@ function createStore(capacity) {
         // Aggregate mass / center of mass - valid for every node once buildQuadtree
         // finishes. Leaves get theirs set directly as particles are inserted; branch
         // nodes get theirs from propagate()'s bottom-up pass.
-        mass: new Float64Array(capacity),
-        comX: new Float64Array(capacity),
-        comY: new Float64Array(capacity),
+        mass: new Float32Array(capacity),
+        comX: new Float32Array(capacity),
+        comY: new Float32Array(capacity),
         // Every node that was subdivided this build, in the order subdivision happened -
         // propagate() walks this in reverse. A child can only be subdivided after its own
         // parent already was (subdivision is what creates the child in the first place),
@@ -74,15 +75,15 @@ function ensureCapacity(store, neededCount) {
         newCapacity *= 2;
     }
 
-    store.x = growTypedArray(store.x, Float64Array, newCapacity);
-    store.y = growTypedArray(store.y, Float64Array, newCapacity);
-    store.size = growTypedArray(store.size, Float64Array, newCapacity);
+    store.x = growTypedArray(store.x, Float32Array, newCapacity);
+    store.y = growTypedArray(store.y, Float32Array, newCapacity);
+    store.size = growTypedArray(store.size, Float32Array, newCapacity);
     store.children = growTypedArray(store.children, Int32Array, newCapacity);
     store.next = growTypedArray(store.next, Int32Array, newCapacity);
     store.occupant = growTypedArray(store.occupant, Int32Array, newCapacity);
-    store.mass = growTypedArray(store.mass, Float64Array, newCapacity);
-    store.comX = growTypedArray(store.comX, Float64Array, newCapacity);
-    store.comY = growTypedArray(store.comY, Float64Array, newCapacity);
+    store.mass = growTypedArray(store.mass, Float32Array, newCapacity);
+    store.comX = growTypedArray(store.comX, Float32Array, newCapacity);
+    store.comY = growTypedArray(store.comY, Float32Array, newCapacity);
     store.parents = growTypedArray(store.parents, Int32Array, newCapacity);
 
     const newBucket = new Array(newCapacity).fill(null);

@@ -2,6 +2,71 @@
 // the system in O(log n) node visits instead of O(n) pairwise checks.
 import constants from '../constants.ts';
 import { buildQuadtree } from './quadtree.ts';
+import createGravityModule from './gravityWasm.mjs';
+
+// The hot path (build a fresh tree, then force-traverse it for every particle) ported to
+// WebAssembly - see src/wasm/gravity.cpp. Only that specific case moves to WASM: when the
+// caller already has a JS-built tree to reuse (merge-mode's "nothing merged this frame, so
+// last tree is still valid" optimization - see simulation.ts), this stays on the plain JS
+// path below, since there's no cheap way to hand a JS quadtree's data to WASM without
+// rebuilding it anyway - and rebuilding is exactly the expensive case this exists to avoid.
+/** @type {any} */
+let wasmModule = null;
+let wasmReady = false;
+let wasmMaxParticles = 0;
+let wasmPosXOffset = 0, wasmPosYOffset = 0, wasmMassOffset = 0, wasmRadiusOffset = 0;
+let wasmAccXOffset = 0, wasmAccYOffset = 0;
+
+/**
+ * Kicks off the (async) WASM module load - call once, early, e.g. when the worker starts.
+ * computeGravity checks wasmReady itself and transparently falls back to the plain JS
+ * implementation below until this resolves, so nothing has to block on it - the very first
+ * frame or two of a session just run the JS path instead.
+ */
+export async function initGravityWasm() {
+    if (wasmReady) return;
+    wasmModule = await createGravityModule();
+    wasmMaxParticles = wasmModule._get_max_particles();
+    // Pointer getters are called once here rather than per-frame - see gravity.cpp's
+    // comment on why these addresses (and the HEAPF32 view built from them) stay valid for
+    // the module's entire lifetime (memory growth is disabled in build.sh specifically so
+    // this caching is safe).
+    wasmPosXOffset = wasmModule._get_pos_x_ptr() >> 2;
+    wasmPosYOffset = wasmModule._get_pos_y_ptr() >> 2;
+    wasmMassOffset = wasmModule._get_mass_ptr() >> 2;
+    wasmRadiusOffset = wasmModule._get_radius_ptr() >> 2;
+    wasmAccXOffset = wasmModule._get_acc_x_ptr() >> 2;
+    wasmAccYOffset = wasmModule._get_acc_y_ptr() >> 2;
+    wasmReady = true;
+}
+
+/**
+ * Copies position/mass/radius into the WASM module's own memory, runs its build-tree-then-
+ * traverse-it kernel, and adds the resulting pure-gravity acceleration onto the system's
+ * existing accX/accY (which already carries the constant external GRAVITY field from
+ * resetAccelerationAll - the WASM side has no notion of that field, it only ever computes
+ * the gravitational contribution, hence += rather than = on the way back out). The four
+ * input copies and two output copies are plain typed-array memcpy-equivalents - at 50k
+ * particles that's a few hundred KB, microseconds next to the hundreds of milliseconds of
+ * compute this replaces.
+ */
+function computeGravityWasm(system) {
+    const count = system.count;
+    const heap = wasmModule.HEAPF32;
+    heap.set(system.posX.subarray(0, count), wasmPosXOffset);
+    heap.set(system.posY.subarray(0, count), wasmPosYOffset);
+    heap.set(system.mass.subarray(0, count), wasmMassOffset);
+    heap.set(system.radius.subarray(0, count), wasmRadiusOffset);
+
+    wasmModule._compute_gravity(count, constants.GRAVITATIONAL_CONSTANT, constants.GRAVITY_SOFTENING_FACTOR, constants.BARNES_HUT_THETA, constants.QUADTREE_MAX_DEPTH, constants.QUADTREE_LEAF_CAPACITY);
+
+    const outAccX = heap.subarray(wasmAccXOffset, wasmAccXOffset + count);
+    const outAccY = heap.subarray(wasmAccYOffset, wasmAccYOffset + count);
+    for (let i = 0; i < count; i++) {
+        system.accX[i] += outAccX[i];
+        system.accY[i] += outAccY[i];
+    }
+}
 
 /**
  * Accumulates gravitational acceleration onto particle i from one specific other body j,
@@ -109,9 +174,31 @@ function applyTreeGravity(system, i, tree, thetaSq) {
  * that tree is already exactly correct for gravity too. Rebuilding it anyway would be
  * pure waste - and became a bigger one once merges got rarer (see merge.ts's notes on
  * MIN_MERGE_VELOCITY), since more frames now have nothing merge on them at all.
+ *
+ * When there's no tree to reuse, this is the "build fresh and traverse for everyone" case
+ * that dominates frame time at high particle counts - routed to the WASM kernel above once
+ * it's loaded and the particle count fits its fixed capacity, falling back to the plain JS
+ * Barnes-Hut implementation otherwise (WASM still loading, or an unusually large run that
+ * exceeds gravity.cpp's MAX_PARTICLES). Returns null in the WASM case rather than a JS tree
+ * object, since there's nothing JS-shaped to hand back - computePotentialEnergy in
+ * energy.ts builds its own fallback tree on demand for the (debug-panel-only, not hot path)
+ * cases that need one.
  */
 export function computeGravity(system, tree) {
-    const gravityTree = tree || buildQuadtree(system);
+    if (tree) {
+        const thetaSq = constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA;
+        for (let i = 0; i < system.count; i++) {
+            applyTreeGravity(system, i, tree, thetaSq);
+        }
+        return tree;
+    }
+
+    if (wasmReady && system.count <= wasmMaxParticles) {
+        computeGravityWasm(system);
+        return null;
+    }
+
+    const gravityTree = buildQuadtree(system);
     const thetaSq = constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA;
     for (let i = 0; i < system.count; i++) {
         applyTreeGravity(system, i, gravityTree, thetaSq);

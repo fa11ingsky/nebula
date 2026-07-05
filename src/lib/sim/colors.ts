@@ -50,3 +50,16 @@ export function getColorForMass(mass) {
     ];
     return interpolateColorStops(stops, mass / constants.MAX_MASS);
 }
+
+/**
+ * The mass gradient exists to show accretion happening - a particle visibly changing
+ * color as it merges its way up toward MAX_MASS. With merging off, mass never changes
+ * (collide.ts only ever touches position/velocity), so every particle would just sit at
+ * whatever color its fixed spawn mass happens to map to - a gradient with nothing left to
+ * show. Flattening everyone to white in that mode reflects that mass isn't a visually
+ * meaningful, changing quantity here anymore, rather than displaying a gradient that's
+ * frozen in place for the entire run.
+ */
+export function getDisplayColorForMass(mass, mergingEnabled) {
+    return mergingEnabled ? getColorForMass(mass) : constants.COLORS.WHITE;
+}

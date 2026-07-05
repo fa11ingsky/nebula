@@ -8,7 +8,7 @@ import { computeGravity } from './gravity.ts';
 import { displayBody } from './particleRender.ts';
 
 export { spawnParticles } from './spawn.ts';
-export { computeCenterOfMass } from './particleSystem.ts';
+export { computeCenterOfMass, recolorAll } from './particleSystem.ts';
 export { computeKineticEnergy, computePotentialEnergy } from './energy.ts';
 
 /**
@@ -39,9 +39,9 @@ export function stepSimulation(system, explosions, mergingEnabled) {
         resetAccelerationAll(system);
         gravityTree = computeGravity(system, mergeResult.anyMerged ? null : mergeResult.tree);
     } else {
-        // Collision resolution only touches velocity, never position or count, so unlike
-        // the merge branch there's no stale-tree concern here - gravity always needs its
-        // own fresh tree in this branch regardless.
+        // Collision resolution finds its neighbors via its own spatial grid (collide.ts),
+        // not the Barnes-Hut quadtree gravity needs - so unlike the merge branch there's no
+        // tree to reuse here regardless, and gravity always builds its own fresh one.
         collideParticles(system);
         resetAccelerationAll(system);
         gravityTree = computeGravity(system, null);

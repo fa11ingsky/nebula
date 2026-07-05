@@ -1,6 +1,6 @@
 <template>
     <div class="simulation">
-        <canvas ref="canvas"></canvas>
+        <canvas ref="canvas" :key="canvasKey"></canvas>
         <div class="debug-panel" v-if="debugPanelVisible">
             <div>v{{ version }}</div>
             <div class="debug-title">Performance</div>
@@ -26,9 +26,13 @@
                 <input type="checkbox" v-model="debugPanelVisible" />
                 Show Debug Info
             </label>
-            <label class="settings-row">
-                <input type="checkbox" v-model="texturesEnabled" />
-                Enable Textures
+            <label class="settings-row" :class="{ disabled: useWebGpu }">
+                <input type="checkbox" v-model="texturesEnabled" :disabled="useWebGpu" />
+                Enable Textures{{ useWebGpu ? ' (Canvas2D only)' : '' }}
+            </label>
+            <label class="settings-row" v-if="webgpuSupported">
+                <input type="checkbox" :checked="useWebGpu" @change="toggleRenderer()" />
+                Use WebGPU Rendering
             </label>
             <label class="settings-row">
                 <input type="checkbox" v-model="crosshairVisible" />
@@ -83,11 +87,24 @@
     import p5 from 'p5';
     import constants from '../lib/constants.ts';
     import { createNebulaBackground } from '../lib/sim/nebulaBackground.ts';
+    import { isWebGPUSupported } from '../lib/sim/webgpuRenderer.ts';
 
     export default {
         data() {
             return {
                 version: constants.VERSION,
+                // Bumped to force Vue to unmount/remount the <canvas> element when
+                // switching rendering backends - see toggleRenderer(). Needed because a
+                // canvas can only ever be given ONE context type (2d or webgpu) for its
+                // entire lifetime; switching backends means handing the worker a brand
+                // new, not-yet-claimed canvas rather than reusing the existing one.
+                canvasKey: 0,
+                // Only shown once the async support check in mounted() resolves true -
+                // most browsers as of this writing don't have WebGPU (or have it behind a
+                // flag), so the checkbox simply doesn't exist rather than being present
+                // and non-functional.
+                webgpuSupported: false,
+                useWebGpu: false,
                 stopped: false,
                 centralMassEnabled: false,
                 // With merging off (the default), colliding bodies bounce off each other
@@ -151,6 +168,10 @@
 
             this.startSimulation();
             window.addEventListener('resize', this.handleResize);
+
+            isWebGPUSupported().then((supported) => {
+                this.webgpuSupported = supported;
+            });
         },
 
         beforeUnmount() {
@@ -196,6 +217,14 @@
                         this.kineticEnergy = msg.kineticEnergy;
                         this.potentialEnergy = msg.potentialEnergy;
                         this.fps = msg.fps;
+                    } else if (msg.type === 'rendererSwitchFailed') {
+                        // Shouldn't normally happen (the settings checkbox only appears
+                        // after its own support check succeeds), but if the worker's
+                        // device/pipeline setup fails anyway, fall back to Canvas2D rather
+                        // than leaving the canvas stuck on a half-initialized renderer.
+                        console.error(`Failed to switch to ${msg.backend} rendering - falling back to Canvas2D.`);
+                        this.useWebGpu = false;
+                        this.switchRenderer('canvas2d');
                     }
                 };
 
@@ -214,6 +243,37 @@
 
             resetSim() {
                 this.worker?.postMessage({ type: 'resetSim', centralMassEnabled: this.centralMassEnabled });
+            },
+            /**
+             * Hands the worker a brand new canvas dedicated to the given rendering
+             * backend. A <canvas> can only ever be given one context type for its whole
+             * lifetime, so switching backends can't just reconfigure the existing one -
+             * bumping canvasKey forces Vue to unmount/remount the element first, giving a
+             * fresh, not-yet-claimed canvas to transfer.
+             */
+            async switchRenderer(backend) {
+                this.canvasKey++;
+                await this.$nextTick();
+
+                const canvasEl = this.$refs.canvas;
+                const width = window.innerWidth;
+                const height = window.innerHeight;
+                canvasEl.width = width;
+                canvasEl.height = height;
+
+                const backgroundBitmap = await this.generateBackgroundBitmap(width, height);
+                const offscreenCanvas = canvasEl.transferControlToOffscreen();
+
+                this.worker?.postMessage({
+                    type: 'switchRenderer',
+                    backend,
+                    canvas: offscreenCanvas,
+                    backgroundBitmap,
+                }, [offscreenCanvas, backgroundBitmap]);
+            },
+            toggleRenderer() {
+                this.useWebGpu = !this.useWebGpu;
+                this.switchRenderer(this.useWebGpu ? 'webgpu' : 'canvas2d');
             },
             toggleCentralMass() {
                 this.centralMassEnabled = !this.centralMassEnabled;
@@ -376,6 +436,15 @@
         height: 14px;
         accent-color: #b06cff;
         cursor: pointer;
+    }
+
+    .settings-row.disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+
+    .settings-row.disabled input {
+        cursor: not-allowed;
     }
 
     .settings-group {

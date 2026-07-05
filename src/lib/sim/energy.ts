@@ -1,5 +1,6 @@
 // Kinetic/potential energy readouts for the debug panel.
 import constants from '../constants.ts';
+import { buildQuadtree } from './quadtree.ts';
 
 /**
  * Total kinetic energy of the system: sum(0.5 * m * v^2). Exact, O(n) - no approximation
@@ -80,12 +81,18 @@ function accumulatePotentialEnergy(system, i, tree, thetaSq) {
  * built for gravity this frame rather than a third rebuild. Every particle traverses the
  * tree independently (same as applyTreeGravity), so each real pair's energy gets counted
  * once from each side - hence the final /2.
+ *
+ * tree can be null when gravity.ts's computeGravity ran on the WASM path instead of the JS
+ * one - there's no JS-shaped tree to hand back in that case (see computeGravity's own
+ * comment), so this builds its own on demand instead. Only affects this debug-panel-only
+ * readout, not the hot path: it only runs while the debug panel is actually visible.
  */
 export function computePotentialEnergy(system, tree) {
+    const peTree = tree || buildQuadtree(system);
     let pe = 0;
     const thetaSq = constants.BARNES_HUT_THETA * constants.BARNES_HUT_THETA;
     for (let i = 0; i < system.count; i++) {
-        pe += accumulatePotentialEnergy(system, i, tree, thetaSq);
+        pe += accumulatePotentialEnergy(system, i, peTree, thetaSq);
     }
     return pe / 2;
 }

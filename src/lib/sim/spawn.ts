@@ -27,8 +27,8 @@ function initializeAngularMomentum(system, targetL) {
     const com = computeCenterOfMass(system);
 
     let momentOfInertia = 0;
-    const offsetX = new Float64Array(system.count);
-    const offsetY = new Float64Array(system.count);
+    const offsetX = new Float32Array(system.count);
+    const offsetY = new Float32Array(system.count);
     for (let i = 0; i < system.count; i++) {
         const dx = system.posX[i] - com.x;
         const dy = system.posY[i] - com.y;
@@ -55,9 +55,13 @@ function initializeAngularMomentum(system, targetL) {
  * body, just ordinary particles spawned within a much smaller radius), then sets up the
  * system's initial rotation. Shared by both the first load and Restart so the two never
  * drift out of sync with each other.
+ *
+ * mergingEnabled controls initial particle color (see colors.ts's getDisplayColorForMass) -
+ * defaults to true so existing callers that don't pass it (tests, mainly) keep the
+ * original mass-gradient coloring rather than silently switching to white.
  * @returns {{state: object, worldCenter: {x: number, y: number}}}
  */
-export function spawnParticles(s, includeCentralMass) {
+export function spawnParticles(s, includeCentralMass, mergingEnabled = true) {
     const centralParticleCount = includeCentralMass
         ? Math.round(constants.TOTAL_PARTICLES * constants.CENTRAL_MASS_FRACTION)
         : 0;
@@ -71,7 +75,7 @@ export function spawnParticles(s, includeCentralMass) {
 
     for (let i = 0; i < constants.TOTAL_PARTICLES; i++) {
         const spawn = randomSpawnPoint(s, centerX, centerY, spawnRadius);
-        addParticle(system, spawn.x, spawn.y, particleMass);
+        addParticle(system, spawn.x, spawn.y, particleMass, mergingEnabled);
     }
 
     if (includeCentralMass) {
@@ -79,7 +83,7 @@ export function spawnParticles(s, includeCentralMass) {
         const clusterStart = system.count;
         for (let i = 0; i < centralParticleCount; i++) {
             const spawn = randomSpawnPoint(s, centerX, centerY, clusterRadius);
-            addParticle(system, spawn.x, spawn.y, particleMass);
+            addParticle(system, spawn.x, spawn.y, particleMass, mergingEnabled);
         }
 
         // randomSpawnPoint scatters each cluster particle independently, so their own

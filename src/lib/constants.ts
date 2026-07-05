@@ -1,7 +1,7 @@
 export default {
     // Shown in the debug panel - bump manually as a quick way to tell, at a glance,
     // whether a deployed build actually picked up recent changes.
-    VERSION: '0.1.1',
+    VERSION: '0.1.2',
     MAX_MASS: 500,
     // Six-stop gradient a particle sweeps through as it gains mass, smallest to heaviest.
     COLORS: {
@@ -71,7 +71,18 @@ export default {
     // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
     // same point - without this, that would try to subdivide forever. Nodes deeper than this
     // just keep a flat list instead of recursing further.
-    QUADTREE_MAX_DEPTH: 18,
+    QUADTREE_MAX_DEPTH: 10,
+    // WASM-only (see src/wasm/gravity.cpp): stop subdividing once a node's particle count
+    // drops to this many or fewer, treating them as one direct-summation leaf instead of
+    // continuing to split down to single-occupant nodes. Subdivision itself has overhead
+    // (partitioning, allocating child nodes, an extra traversal level for every visitor),
+    // so for a small enough batch, a handful of direct pairwise force calculations is
+    // cheaper than isolating each particle into its own leaf. Too high wastes time on
+    // direct pairwise checks a coarser aggregate could've approximated instead; too low
+    // (down to 1) recovers the old single-occupant-leaf behavior at the cost of more
+    // subdivisions. 8 is a common starting point in other Barnes-Hut implementations -
+    // tune based on measured frame time at your actual particle counts.
+    QUADTREE_LEAF_CAPACITY: 16,
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,

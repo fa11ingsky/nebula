@@ -1,7 +1,7 @@
 // The struct-of-arrays particle store and its most basic per-frame operations
 // (kick/drift/reset-acceleration) and queries (center of mass).
 import constants from '../constants.ts';
-import { getColorForMass } from './colors.ts';
+import { getDisplayColorForMass } from './colors.ts';
 import { generateSurfaceFeatures } from './surfaceFeatures.ts';
 
 /**
@@ -30,27 +30,27 @@ export function createParticleSystem(capacity) {
     return {
         capacity,
         count: 0,
-        posX: new Float64Array(capacity),
-        posY: new Float64Array(capacity),
-        velX: new Float64Array(capacity),
-        velY: new Float64Array(capacity),
-        accX: new Float64Array(capacity),
-        accY: new Float64Array(capacity),
-        mass: new Float64Array(capacity),
-        radius: new Float64Array(capacity),
+        posX: new Float32Array(capacity),
+        posY: new Float32Array(capacity),
+        velX: new Float32Array(capacity),
+        velY: new Float32Array(capacity),
+        accX: new Float32Array(capacity),
+        accY: new Float32Array(capacity),
+        mass: new Float32Array(capacity),
+        radius: new Float32Array(capacity),
         colorR: new Uint8Array(capacity),
         colorG: new Uint8Array(capacity),
         colorB: new Uint8Array(capacity),
         colorString: new Array(capacity).fill(''),
         removed: new Uint8Array(capacity),
         // Clamped tree-insertion coordinates - see quadtree.ts's buildQuadtree.
-        treeX: new Float64Array(capacity),
-        treeY: new Float64Array(capacity),
+        treeX: new Float32Array(capacity),
+        treeY: new Float32Array(capacity),
         surface: new Array(capacity).fill(null),
     };
 }
 
-export function addParticle(system, x, y, mass) {
+export function addParticle(system, x, y, mass, mergingEnabled = true) {
     const i = system.count;
     system.posX[i] = x;
     system.posY[i] = y;
@@ -60,13 +60,29 @@ export function addParticle(system, x, y, mass) {
     system.accY[i] = constants.GRAVITY.Y;
     system.mass[i] = mass;
     system.radius[i] = Math.sqrt(mass);
-    const color = getColorForMass(mass);
+    const color = getDisplayColorForMass(mass, mergingEnabled);
     system.colorR[i] = color[0];
     system.colorG[i] = color[1];
     system.colorB[i] = color[2];
     system.colorString[i] = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
     system.surface[i] = generateSurfaceFeatures(mass);
     system.count++;
+}
+
+/**
+ * Recolors every live particle to match a mergingEnabled toggle flipped mid-run - without
+ * this, switching merging on/off wouldn't visibly change anything until the next Restart,
+ * since color is otherwise only ever set at spawn time (or, in merge mode, when
+ * mergeParticles actually fuses two bodies).
+ */
+export function recolorAll(system, mergingEnabled) {
+    for (let i = 0; i < system.count; i++) {
+        const color = getDisplayColorForMass(system.mass[i], mergingEnabled);
+        system.colorR[i] = color[0];
+        system.colorG[i] = color[1];
+        system.colorB[i] = color[2];
+        system.colorString[i] = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+    }
 }
 
 export function kickAll(system, dt) {
