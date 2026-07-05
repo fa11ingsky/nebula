@@ -35,12 +35,11 @@
 import constants from '../lib/constants.ts';
 import * as simulation from '../lib/sim/simulation.ts';
 import { createWebGPURenderer, resizeWebGPURenderer, setWebGPUBackground, renderWebGPUFrame, destroyWebGPURenderer } from '../lib/sim/webgpuRenderer.ts';
-import { initGravityWasm } from '../lib/sim/gravity.ts';
 
 // Fire-and-forget: gravity.ts's computeGravity checks readiness itself and transparently
 // runs the plain JS Barnes-Hut path until this resolves, so nothing here needs to await it
 // - worst case, the first frame or two of a session use JS gravity instead of WASM.
-initGravityWasm();
+simulation.initGravityWasm();
 
 let canvas = null;
 let ctx = null;
@@ -212,6 +211,7 @@ function tick() {
                 kineticEnergy: simulation.computeKineticEnergy(state),
                 potentialEnergy: simulation.computePotentialEnergy(state, gravityTree),
                 fps: smoothedFps,
+                gravityBackend: simulation.getGravityBackendLabel(),
             });
         }
 

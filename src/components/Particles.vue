@@ -5,6 +5,7 @@
             <div>v{{ version }}</div>
             <div class="debug-title">Performance</div>
             <div>fps: {{ fps.toFixed(1) }}</div>
+            <div>gravity: {{ gravityBackend }}</div>
             <div class="debug-title">Center of Mass</div>
             <div>x: {{ centerOfMass.x.toFixed(2) }}</div>
             <div>y: {{ centerOfMass.y.toFixed(2) }}</div>
@@ -144,7 +145,8 @@
                 // thread at all anymore, so this is the only way these numbers get here.
                 centerOfMass: { x: 0, y: 0 },
                 kineticEnergy: 0,
-                potentialEnergy: 0
+                potentialEnergy: 0,
+                gravityBackend: '...'
             };
         },
 
@@ -217,6 +219,7 @@
                         this.kineticEnergy = msg.kineticEnergy;
                         this.potentialEnergy = msg.potentialEnergy;
                         this.fps = msg.fps;
+                        this.gravityBackend = msg.gravityBackend;
                     } else if (msg.type === 'rendererSwitchFailed') {
                         // Shouldn't normally happen (the settings checkbox only appears
                         // after its own support check succeeds), but if the worker's

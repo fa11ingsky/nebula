@@ -3,6 +3,7 @@
 // kinetic energy per COLLISION_RESTITUTION) instead of combining into one body.
 import constants from '../constants.ts';
 import { buildSpatialGrid, findNearbyInGrid } from './spatialGrid.ts';
+import { isSpatialWasmReady, getSpatialWasmMaxParticles, buildCollisionTreeWasm, findNearbyWasm } from './gravity.ts';
 
 // Snapshot of every particle's velocity at the moment this frame's drift actually ran,
 // reused across frames and grown as needed (same pattern as the quadtree's node store) -
@@ -200,17 +201,28 @@ function resolveImpulse(system, i, j, nx, ny, remainingT) {
  * bounce this same frame (standard sequential impulse resolution) - only the geometry
  * reconstruction needs the frozen snapshot.
  *
- * Candidate lookup uses a uniform spatial grid (spatialGrid.ts) rather than the
- * Barnes-Hut quadtree gravity relies on - collision only ever needs "particles within
- * roughly one particle's width," a bounded-radius query the grid answers in a handful of
- * direct cell lookups, versus the tree's O(log n) recursive descent with pruning tests
- * paying for hierarchy this query doesn't need. It also means gravity's own tree (built
- * fresh right after this function returns) is the only quadtree built per frame in
- * collision mode, instead of the two it used to take.
+ * Candidate lookup prefers the WASM tree (gravity.cpp's build_collision_tree/
+ * find_nearby_collision_candidates - see that file's header comment) over the JS uniform
+ * grid (spatialGrid.ts, kept as the fallback for when WASM isn't ready yet or the particle
+ * count exceeds its fixed capacity). The grid was originally built to replace an earlier
+ * quadtree-based version of this search - a bounded-radius query a uniform grid answers in
+ * a handful of direct cell lookups, versus a tree's O(log n) descent with pruning tests
+ * paying for hierarchy the query doesn't need - but a fixed cell size doesn't adapt to
+ * density: profiling with the distributed central-mass feature enabled showed 50+
+ * particles landing in a single grid cell sized for ~4, degrading that "handful of lookups"
+ * into an effectively O(n) scan for every particle in the dense region. A tree doesn't have
+ * that failure mode (it just subdivides the dense region further), and WASM keeps it fast
+ * even so.
  */
 export function collideParticles(system) {
-    const grid = buildSpatialGrid(system);
     const count = system.count;
+    const useWasm = isSpatialWasmReady() && count <= getSpatialWasmMaxParticles();
+    let grid = null;
+    if (useWasm) {
+        buildCollisionTreeWasm(system);
+    } else {
+        grid = buildSpatialGrid(system);
+    }
 
     ensureVelocitySnapshotCapacity(count);
     for (let i = 0; i < count; i++) {
@@ -238,7 +250,12 @@ export function collideParticles(system) {
     for (let i = 0; i < count; i++) {
         const speedI = Math.sqrt(origVelX[i] * origVelX[i] + origVelY[i] * origVelY[i]);
         candidates.length = 0;
-        findNearbyInGrid(grid, system, i, system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI, candidates);
+        const searchRadius = system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI;
+        if (useWasm) {
+            findNearbyWasm(system, i, searchRadius, candidates);
+        } else {
+            findNearbyInGrid(grid, system, i, searchRadius, candidates);
+        }
 
         for (const j of candidates) {
             const pairKey = i < j ? i * system.capacity + j : j * system.capacity + i;

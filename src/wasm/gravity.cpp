@@ -5,6 +5,18 @@
 // copies position/mass/radius in, calls compute_gravity(), then copies acceleration back
 // out - see gravity.ts's computeGravityWasm for that boundary.
 //
+// This file's tree (buildTree, below) is also reused for collide.ts's broad-phase nearby-
+// particle search (find_nearby_collision_candidates) - the same relationship quadtree.ts
+// has with both gravity.ts and merge.ts in the pure-JS code, just carried over to the WASM
+// side. That's a deliberate replacement for collide.ts's previous uniform spatial grid
+// (spatialGrid.ts, still kept as the JS fallback): a fixed-cell-size grid degrades badly
+// under highly non-uniform density (measured directly - the "distributed central mass"
+// feature can pack 50+ particles into a single grid cell sized for ~4, since it crams a
+// large fraction of the swarm into a tiny fraction of the domain, and that packing gets
+// denser over time as gravity keeps accreting more particles into the core). A tree
+// doesn't have this failure mode - it just subdivides the dense region further, the same
+// way it already does for gravity's own force accuracy.
+//
 // Tree construction here is a partition-based build, not the one-at-a-time insertion
 // quadtree.ts uses: given a range of particle indices, split it into 4 contiguous
 // sub-ranges by the node's center (one in-place partition on y, then one each on the
@@ -25,8 +37,11 @@
 // a run ever exceeds MAX_PARTICLES, compute_gravity is a deliberate no-op and the caller
 // falls back to the JS implementation - see the capacity check near compute_gravity.
 #include <emscripten/emscripten.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <thread>
+#include <vector>
 
 // Comfortably above the largest TOTAL_PARTICLES_OPTIONS entry in constants.ts (50000) so
 // normal use never falls back to JS. A generous worst-case node budget: with leaf-capacity
@@ -36,6 +51,13 @@
 // leaf capacity.
 #define MAX_PARTICLES 70000
 #define MAX_NODES (MAX_PARTICLES * 4 + 4096)
+// Cap on how many candidate indices one find_nearby_collision_candidates() call can return
+// - collide.ts's own swept-collision math still exactly filters these afterward (this is a
+// broad-phase superset, same contract as quadtree.ts's findNearbyParticles/spatialGrid.ts's
+// findNearbyInGrid), so a capped result degrades gracefully: missing a rare, extreme-
+// density collision only means it resolves a frame later once the pair's still overlapping
+// on the next call, not a correctness failure.
+#define MAX_CANDIDATES 4096
 
 // --- Particle data: the JS/WASM boundary ---------------------------------------------
 // Input (JS writes these every frame before calling compute_gravity) and output (JS reads
@@ -50,6 +72,13 @@ static float g_accX[MAX_PARTICLES];
 static float g_accY[MAX_PARTICLES];
 static float g_treeX[MAX_PARTICLES];
 static float g_treeY[MAX_PARTICLES];
+
+// Output buffer for find_nearby_collision_candidates - a single shared buffer, overwritten
+// by each call, since collide.ts's JS loop calls this once per particle and always reads
+// the result before making the next call (never concurrently, single-threaded control flow
+// from JS). Same reuse pattern as g_accX/g_accY: one persistent buffer, no per-call
+// allocation.
+static int32_t g_candidateBuffer[MAX_CANDIDATES];
 
 // order[] holds particle indices, reordered in place during the build so that every node's
 // members occupy a contiguous range [leafStart, leafStart+leafCount) - see partitionRange
@@ -373,20 +402,86 @@ static void applyTreeGravity(int32_t i, float thetaSq, float G, float softeningF
     }
 }
 
+// Runs applyTreeGravity for a contiguous slice [startI, endI) of particles - the unit of
+// work compute_gravity hands to each thread. Splitting by raw particle index rather than
+// anything spatial is deliberate and safe here: particle index is spawn order, which has
+// no lasting correlation with where a particle ends up after the swarm's been evolving for
+// a while, so a plain contiguous split already spreads spatial density (and therefore
+// per-particle traversal cost) evenly across threads on average, without needing an actual
+// work-stealing scheduler.
+static void computeGravityForRange(int32_t startI, int32_t endI, float thetaSq, float G, float softeningFactor) {
+    for (int32_t i = startI; i < endI; i++) {
+        applyTreeGravity(i, thetaSq, G, softeningFactor);
+    }
+}
+
+// --- Collision broad-phase (find_nearby_collision_candidates) -----------------------
+// Direct port of quadtree.ts's findNearbyParticles onto this file's partition-based tree:
+// collect every particle within searchRadius of particle i, pruning subtrees whose
+// bounding box can't possibly contain a point that close (closest-point-on-box test).
+// Unlike gravity's traversal, this never aggregates - collision needs exact candidate
+// indices, not a force approximation, so every node visit either prunes the whole subtree
+// or (for a leaf) adds its members directly.
+static int32_t findNearbyCollisionCandidates(int32_t i, float searchRadius) {
+    float px = g_posX[i];
+    float py = g_posY[i];
+    float searchRadiusSq = searchRadius * searchRadius;
+    int32_t outCount = 0;
+    int32_t node = 0;
+
+    while (node != -1) {
+        if (nodeMass[node] == 0.f) {
+            node = nodeNext[node]; // empty subtree - nothing to prune-test, just skip
+            continue;
+        }
+
+        float nodeXv = nodeX[node];
+        float nodeYv = nodeY[node];
+        float nodeSizeV = nodeSize[node];
+        float closestX = fminf(fmaxf(px, nodeXv), nodeXv + nodeSizeV);
+        float closestY = fminf(fmaxf(py, nodeYv), nodeYv + nodeSizeV);
+        float dx = px - closestX;
+        float dy = py - closestY;
+
+        if (dx * dx + dy * dy > searchRadiusSq) {
+            node = nodeNext[node]; // whole subtree pruned - its box can't be close enough
+            continue;
+        }
+
+        if (nodeChildren[node] == -1) {
+            int32_t start = nodeLeafStart[node];
+            int32_t cnt = nodeLeafCount[node];
+            for (int32_t k = 0; k < cnt && outCount < MAX_CANDIDATES; k++) {
+                int32_t j = order[start + k];
+                if (j != i) {
+                    g_candidateBuffer[outCount++] = j;
+                }
+            }
+            node = nodeNext[node];
+        } else {
+            node = nodeChildren[node]; // box is close enough - check children individually
+        }
+    }
+
+    return outCount;
+}
+
 extern "C" {
 
 // Pointer getters: called once by the JS side right after the module loads, so it can
 // compute HEAPF32 offsets for the input/output arrays without any per-frame marshaling
 // overhead - see gravity.ts's initGravityWasm. Memory growth is disabled for this module
-// (see build.sh), so these addresses - and any HEAPF32 view built from them - stay valid
-// for the module's entire lifetime.
+// (see package.json's build:wasm/build:wasm:threaded scripts), so these addresses - and
+// any HEAPF32 view built from them - stay valid for the module's entire lifetime.
 EMSCRIPTEN_KEEPALIVE float* get_pos_x_ptr() { return g_posX; }
 EMSCRIPTEN_KEEPALIVE float* get_pos_y_ptr() { return g_posY; }
 EMSCRIPTEN_KEEPALIVE float* get_mass_ptr() { return g_mass; }
 EMSCRIPTEN_KEEPALIVE float* get_radius_ptr() { return g_radius; }
 EMSCRIPTEN_KEEPALIVE float* get_acc_x_ptr() { return g_accX; }
 EMSCRIPTEN_KEEPALIVE float* get_acc_y_ptr() { return g_accY; }
+EMSCRIPTEN_KEEPALIVE int32_t* get_candidate_buffer_ptr() { return g_candidateBuffer; }
 EMSCRIPTEN_KEEPALIVE int get_max_particles() { return MAX_PARTICLES; }
+EMSCRIPTEN_KEEPALIVE int get_max_candidates() { return MAX_CANDIDATES; }
 
 // Builds a fresh tree from whatever's currently sitting in g_posX/g_posY/g_mass/g_radius
 // (JS writes those via the pointers above before calling this) and fills g_accX/g_accY
@@ -409,9 +504,84 @@ EMSCRIPTEN_KEEPALIVE void compute_gravity(int count, float G, float softeningFac
         g_accX[i] = 0.f;
         g_accY[i] = 0.f;
     }
-    for (int i = 0; i < count; i++) {
-        applyTreeGravity(i, thetaSq, G, softeningFactor);
+    // Each particle's traversal only ever reads the (already fully built) tree and writes
+    // its own g_accX[i]/g_accY[i] - never any other particle's, and never any shared
+    // mutable state - so splitting this loop across threads is race-free by construction,
+    // the same "embarrassingly parallel" property the reference Rust implementation's
+    // par_iter_mut exploits. Tree *construction* stays single-threaded (see buildTree) -
+    // it's already the cheaper half of this function per profiling, and parallelizing the
+    // partition-based build safely needs its own work-distribution scheme, not just a loop
+    // split. Plain std::thread rather than OpenMP: this Emscripten install doesn't ship
+    // libomp/omp.h, but -pthread alone is enough for std::thread, which is all this needs.
+    //
+    // hardware_concurrency() reflects navigator.hardwareConcurrency once compiled with
+    // -pthread (see package.json's build:wasm:threaded script) - on a non-threaded build
+    // (package.json's plain build:wasm, no -pthread) it reports 0 (per the standard's
+    // documented fallback for "not computable"), which the clamp below turns into a single
+    // sequential pass. That's what lets gravity.cpp itself stay identical between the two
+    // builds - whether this actually runs in parallel is entirely a compile-flag / runtime
+    // (crossOriginIsolated) question, never a code-path branch here.
+    unsigned int hwThreads = std::thread::hardware_concurrency();
+    int32_t threadCount = hwThreads < 1 ? 1 : (int32_t)std::min(hwThreads, 16u);
+    if (threadCount > count) {
+        threadCount = count > 0 ? count : 1;
     }
+
+    if (threadCount <= 1) {
+        computeGravityForRange(0, count, thetaSq, G, softeningFactor);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(threadCount);
+        int32_t chunk = (count + threadCount - 1) / threadCount;
+        for (int32_t t = 0; t < threadCount; t++) {
+            int32_t startI = t * chunk;
+            int32_t endI = std::min(startI + chunk, count);
+            if (startI >= endI) break;
+            workers.emplace_back(computeGravityForRange, startI, endI, thetaSq, G, softeningFactor);
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
+}
+
+// Builds a fresh tree for collide.ts's broad-phase search, from whatever's currently
+// sitting in g_posX/g_posY/g_mass/g_radius (same input buffers compute_gravity uses -
+// collision and gravity never run concurrently within a frame, so sharing them is safe;
+// see simulation.ts's stepSimulation for why collision always runs first and gravity
+// always rebuilds fresh afterward regardless). Takes its own leafCapacity separate from
+// compute_gravity's: gravity wants coarser leaves (batches more direct-sum work per node
+// to justify fewer subdivisions), collision wants finer ones (fewer false-positive
+// candidates needing a full swept-collision check in JS) - see constants.ts's
+// COLLISION_TREE_LEAF_CAPACITY. Silently does nothing if count exceeds this module's fixed
+// capacity, same contract as compute_gravity - the caller checks get_max_particles() first.
+EMSCRIPTEN_KEEPALIVE void build_collision_tree(int count, int quadtreeMaxDepth, int leafCapacity) {
+    if (count < 0 || count > MAX_PARTICLES) {
+        return;
+    }
+    g_quadtreeMaxDepth = quadtreeMaxDepth;
+    g_leafCapacity = leafCapacity < 1 ? 1 : leafCapacity;
+    buildTree(count);
+}
+
+// Temporary diagnostic: largest leaf occupancy in the tree just built. Not used by
+// collide.ts - only for tuning QUADTREE_MAX_DEPTH/leaf capacity against real density.
+EMSCRIPTEN_KEEPALIVE int debug_max_leaf_occupancy() {
+    int32_t maxCount = 0;
+    for (int32_t n = 0; n < nodeCount; n++) {
+        if (nodeChildren[n] == -1 && nodeLeafCount[n] > maxCount) {
+            maxCount = nodeLeafCount[n];
+        }
+    }
+    return maxCount;
+}
+
+// Collects every particle within searchRadius of particle i into g_candidateBuffer (read
+// back via get_candidate_buffer_ptr) and returns how many were found. Must be called after
+// build_collision_tree, once per particle - see collide.ts's findNearbyWasm for the JS side
+// of this loop, and findNearbyCollisionCandidates above for the traversal itself.
+EMSCRIPTEN_KEEPALIVE int find_nearby_collision_candidates(int i, float searchRadius) {
+    return findNearbyCollisionCandidates(i, searchRadius);
 }
 
 } // extern "C"

@@ -10,6 +10,7 @@ import { displayBody } from './particleRender.ts';
 export { spawnParticles } from './spawn.ts';
 export { computeCenterOfMass, recolorAll } from './particleSystem.ts';
 export { computeKineticEnergy, computePotentialEnergy } from './energy.ts';
+export { initGravityWasm, getGravityBackendLabel } from './gravity.ts';
 
 /**
  * Runs one full physics frame on the given system, mutating it in place.
@@ -39,9 +40,12 @@ export function stepSimulation(system, explosions, mergingEnabled) {
         resetAccelerationAll(system);
         gravityTree = computeGravity(system, mergeResult.anyMerged ? null : mergeResult.tree);
     } else {
-        // Collision resolution finds its neighbors via its own spatial grid (collide.ts),
-        // not the Barnes-Hut quadtree gravity needs - so unlike the merge branch there's no
-        // tree to reuse here regardless, and gravity always builds its own fresh one.
+        // Collision resolution builds its own tree for neighbor search (collide.ts, backed
+        // by gravity.cpp's WASM tree or, as a fallback, spatialGrid.ts's JS grid) and
+        // mutates positions/velocities resolving contacts - so by the time it returns, that
+        // tree no longer matches the (now-changed) positions. Unlike the merge branch,
+        // there's no valid tree to hand off here regardless of which backend collision
+        // used; gravity always builds its own fresh one on the post-collision positions.
         collideParticles(system);
         resetAccelerationAll(system);
         gravityTree = computeGravity(system, null);

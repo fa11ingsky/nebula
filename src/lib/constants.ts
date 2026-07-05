@@ -1,7 +1,7 @@
 export default {
     // Shown in the debug panel - bump manually as a quick way to tell, at a glance,
     // whether a deployed build actually picked up recent changes.
-    VERSION: '0.1.2',
+    VERSION: '0.1.3',
     MAX_MASS: 500,
     // Six-stop gradient a particle sweeps through as it gains mass, smallest to heaviest.
     COLORS: {
@@ -83,6 +83,28 @@ export default {
     // subdivisions. 8 is a common starting point in other Barnes-Hut implementations -
     // tune based on measured frame time at your actual particle counts.
     QUADTREE_LEAF_CAPACITY: 16,
+    // WASM-only (see src/wasm/gravity.cpp's build_collision_tree): the same idea as
+    // QUADTREE_LEAF_CAPACITY, but for the separate tree collide.ts's broad-phase search
+    // builds - kept as its own constant because the right tuning point is different for
+    // the two purposes. Gravity wants coarser leaves (a bigger direct-summation batch is
+    // fine, since every member contributes real force regardless of whether it's nearby or
+    // just node-adjacent). Collision wants finer leaves: every candidate a leaf returns
+    // still has to run through collide.ts's exact swept-collision math, so an oversized
+    // leaf mostly just hands back particles that were never actually going to touch -
+    // wasted work in JS, not saved work in WASM. Small (2-8) is the right range here.
+    COLLISION_TREE_LEAF_CAPACITY: 4,
+    // Separate max-depth safety cap for that same collision tree, independent of
+    // QUADTREE_MAX_DEPTH - measured directly, sharing one depth cap between the two trees
+    // was actively wrong: QUADTREE_MAX_DEPTH is tuned low (10) for gravity's tree, where a
+    // shallow cap is fine since aggregation handles distant nodes regardless of depth. The
+    // collision tree has no such escape hatch - COLLISION_TREE_LEAF_CAPACITY only actually
+    // bounds leaf size if there's enough depth budget to subdivide that far down. Profiling
+    // with the distributed central-mass feature enabled (which packs particles into a much
+    // denser cluster than gravity's tree ever has to fully separate) showed leaves still
+    // holding 72 particles at depth 10, versus correctly settling at ~4 by depth 18 - so
+    // this needs to go deep enough for the density collision actually has to handle, not
+    // whatever's fast enough for gravity's very different access pattern.
+    COLLISION_TREE_MAX_DEPTH: 18,
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,
@@ -125,5 +147,5 @@ export default {
     // resolveOverlap. Purely cosmetic: without it, two bounced circles can render with
     // their edges exactly coincident (or overlapping by a sub-pixel floating-point
     // residue), which reads as a visual glitch even though it's numerically correct.
-    COLLISION_SURFACE_GAP: 2
+    COLLISION_SURFACE_GAP: 1
 }
