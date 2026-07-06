@@ -1,7 +1,7 @@
 export default {
     // Shown in the debug panel - bump manually as a quick way to tell, at a glance,
     // whether a deployed build actually picked up recent changes.
-    VERSION: '0.1.4',
+    VERSION: '0.1.5',
     MAX_MASS: 500,
     // Six-stop gradient a particle sweeps through as it gains mass, smallest to heaviest.
     COLORS: {
