@@ -119,21 +119,13 @@ export default {
     // Particles spawn within this fraction of half the canvas size, keeping the initial
     // cluster comfortably inside the visible area.
     SPAWN_RADIUS_FRACTION: 0.95,
-    // The optional central mass isn't one dominant body - it's a dense cluster of
-    // ordinary swarm particles (same per-particle mass as everyone else) spawned within a
-    // small radius at the center instead of spread across the whole disc. This is that
-    // cluster's share of the total particle count (and so, since every particle has equal
-    // mass, of MAX_MASS too) - e.g. 0.2 with TOTAL_PARTICLES=2500 means 500 of those 2500
-    // particles spawn packed into the center instead of scattered through the disc.
-    CENTRAL_MASS_FRACTION: 0.2,
-    // How tightly packed that central cluster spawns, as a fraction of the swarm's own
-    // spawn radius - small enough to read as a dense "core" rather than just a denser
-    // patch of the same disc, but not a literal single point (letting the cluster's own
-    // particles start at slightly different positions avoids spawning many bodies exactly
-    // coincident, which is otherwise harmless - softening and the quadtree's bucket
-    // fallback both handle it - but looks like a visual glitch before gravity pulls them
-    // into a natural clump anyway).
-    CENTRAL_CLUSTER_RADIUS_FRACTION: 0.05,
+    // The optional central mass is a single fixed particle (see particleSystem.ts's `fixed`
+    // field and spawn.ts) planted exactly at the arena center, holding this fraction of
+    // MAX_MASS - e.g. 0.2 with MAX_MASS=500 gives it a mass of 100, same total mass the
+    // swarm's own particles sum to. It attracts and can be collided with like any other
+    // body, it just never moves itself, acting as a fixed anchor the swarm orbits/accretes
+    // around rather than one more free body in the system.
+    CENTRAL_MASS_FRACTION: 0.1,
     // Two particles within merge distance only actually fuse if their relative (closing)
     // speed is at least this - a slow graze just passes through without merging. This is a
     // deliberately small default: it's meant to filter out only the gentlest near-misses
@@ -158,5 +150,5 @@ export default {
     // resolveOverlap. Purely cosmetic: without it, two bounced circles can render with
     // their edges exactly coincident (or overlapping by a sub-pixel floating-point
     // residue), which reads as a visual glitch even though it's numerically correct.
-    COLLISION_SURFACE_GAP: 1
+    COLLISION_SURFACE_GAP: 0
 }

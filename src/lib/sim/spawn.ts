@@ -30,6 +30,7 @@ function initializeAngularMomentum(system, targetL) {
     const offsetX = new Float32Array(system.count);
     const offsetY = new Float32Array(system.count);
     for (let i = 0; i < system.count; i++) {
+        if (system.fixed[i]) continue; // never assigned a velocity - see the loop below
         const dx = system.posX[i] - com.x;
         const dy = system.posY[i] - com.y;
         offsetX[i] = dx;
@@ -43,18 +44,29 @@ function initializeAngularMomentum(system, targetL) {
 
     const omega = targetL / momentOfInertia;
 
+    // A fixed particle (see particleSystem.ts) is deliberately left at velocity 0 rather
+    // than the v=omega*r' every other particle gets - not just because driftAll would
+    // ignore it anyway, but because assigning it a nonzero velocity would misreport
+    // kinetic energy in the debug panel for a body that can never actually move. The
+    // "total linear momentum exactly zero" proof in this function's own doc comment
+    // assumes every particle follows v=omega*r'; excluding a fixed body breaks that
+    // exactly, in proportion to how far it sits from the center of mass - expected and
+    // accepted here, the same way a real collision with an immovable wall doesn't
+    // conserve just the ball's own momentum.
     for (let i = 0; i < system.count; i++) {
+        if (system.fixed[i]) continue;
         system.velX[i] = -omega * offsetY[i];
         system.velY[i] = omega * offsetX[i];
     }
 }
 
 /**
- * Builds the swarm, optionally with an extra dense cluster of particles packed into the
- * center (see CENTRAL_MASS_FRACTION/CENTRAL_CLUSTER_RADIUS_FRACTION - not one dominant
- * body, just ordinary particles spawned within a much smaller radius), then sets up the
- * system's initial rotation. Shared by both the first load and Restart so the two never
- * drift out of sync with each other.
+ * Builds the swarm, optionally with one additional central body - a single fixed particle
+ * at the exact arena center, holding CENTRAL_MASS_FRACTION of MAX_MASS, that gravity and
+ * collisions can act on (it attracts and can be bounced off of) but that never itself
+ * moves - see particleSystem.ts's `fixed` field. Then sets up the system's initial
+ * rotation. Shared by both the first load and Restart so the two never drift out of sync
+ * with each other.
  *
  * mergingEnabled controls initial particle color (see colors.ts's getDisplayColorForMass) -
  * defaults to true so existing callers that don't pass it (tests, mainly) keep the
@@ -62,16 +74,14 @@ function initializeAngularMomentum(system, targetL) {
  * @returns {{state: object, worldCenter: {x: number, y: number}}}
  */
 export function spawnParticles(s, includeCentralMass, mergingEnabled = true) {
-    const centralParticleCount = includeCentralMass
-        ? Math.round(constants.TOTAL_PARTICLES * constants.CENTRAL_MASS_FRACTION)
-        : 0;
-    const capacity = constants.TOTAL_PARTICLES + centralParticleCount;
+    const capacity = constants.TOTAL_PARTICLES + (includeCentralMass ? 1 : 0);
     const system = createParticleSystem(capacity);
 
     const centerX = s.width / 2;
     const centerY = s.height / 2;
     const spawnRadius = Math.min(s.width, s.height) / 2 * constants.SPAWN_RADIUS_FRACTION;
     const particleMass = constants.MAX_MASS / constants.TOTAL_PARTICLES;
+    const particleRadius = Math.sqrt(particleMass);
 
     for (let i = 0; i < constants.TOTAL_PARTICLES; i++) {
         const spawn = randomSpawnPoint(s, centerX, centerY, spawnRadius);
@@ -79,31 +89,14 @@ export function spawnParticles(s, includeCentralMass, mergingEnabled = true) {
     }
 
     if (includeCentralMass) {
-        const clusterRadius = spawnRadius * constants.CENTRAL_CLUSTER_RADIUS_FRACTION;
-        const clusterStart = system.count;
-        for (let i = 0; i < centralParticleCount; i++) {
-            const spawn = randomSpawnPoint(s, centerX, centerY, clusterRadius);
-            addParticle(system, spawn.x, spawn.y, particleMass, mergingEnabled);
-        }
-
-        // randomSpawnPoint scatters each cluster particle independently, so their own
-        // average position lands near (centerX, centerY) only statistically, not exactly -
-        // for a small cluster particle count especially, an unlucky draw can leave the
-        // whole cluster visibly off-center. Since every cluster particle has equal mass,
-        // shifting all of them by the same delta re-centers their centroid exactly on the
-        // arena's center without disturbing the cluster's shape or density.
-        let sumX = 0;
-        let sumY = 0;
-        for (let i = clusterStart; i < system.count; i++) {
-            sumX += system.posX[i];
-            sumY += system.posY[i];
-        }
-        const shiftX = centerX - sumX / centralParticleCount;
-        const shiftY = centerY - sumY / centralParticleCount;
-        for (let i = clusterStart; i < system.count; i++) {
-            system.posX[i] += shiftX;
-            system.posY[i] += shiftY;
-        }
+        const centralMass = constants.MAX_MASS * constants.CENTRAL_MASS_FRACTION;
+        // Radius deliberately pinned to an ordinary swarm particle's size (not
+        // sqrt(centralMass), what it would get by default) - it needs a large mass for
+        // gravity to treat it as the dominant body, but should still read as an
+        // ordinary-sized particle rather than a giant sphere, and (with merging off, so
+        // nothing ever changes mass or radius again after spawn - see merge.ts, the only
+        // place that reassigns radius) this stays true for the entire session.
+        addParticle(system, centerX, centerY, centralMass, mergingEnabled, true, particleRadius);
     }
 
     initializeAngularMomentum(system, constants.TOTAL_ANGULAR_MOMENTUM);

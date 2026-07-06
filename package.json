@@ -12,7 +12,9 @@
     "deploy": "gh-pages -d dist",
     "build:wasm": "emcc src/wasm/gravity.cpp -O3 -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORT_NAME=createGravityModule -s ENVIRONMENT=web,worker,node -s ALLOW_MEMORY_GROWTH=0 -s INITIAL_MEMORY=67108864 -s SINGLE_FILE=1 -s FILESYSTEM=0 -s EXPORTED_FUNCTIONS=_compute_gravity,_get_pos_x_ptr,_get_pos_y_ptr,_get_mass_ptr,_get_radius_ptr,_get_acc_x_ptr,_get_acc_y_ptr,_get_max_particles,_build_collision_tree,_find_nearby_collision_candidates,_get_candidate_buffer_ptr,_get_max_candidates,_debug_max_leaf_occupancy -s EXPORTED_RUNTIME_METHODS=HEAPF32,HEAP32 -o src/lib/sim/gravityWasm.mjs",
     "build:wasm:threaded": "emcc src/wasm/gravity.cpp -O3 -pthread -s PTHREAD_POOL_SIZE=navigator.hardwareConcurrency -s MODULARIZE=1 -s EXPORT_ES6=1 -s EXPORT_NAME=createGravityModule -s ENVIRONMENT=web,worker -s ALLOW_MEMORY_GROWTH=0 -s INITIAL_MEMORY=67108864 -s FILESYSTEM=0 -s EXPORTED_FUNCTIONS=_compute_gravity,_get_pos_x_ptr,_get_pos_y_ptr,_get_mass_ptr,_get_radius_ptr,_get_acc_x_ptr,_get_acc_y_ptr,_get_max_particles,_build_collision_tree,_find_nearby_collision_candidates,_get_candidate_buffer_ptr,_get_max_candidates -s EXPORTED_RUNTIME_METHODS=HEAPF32,HEAP32 -o src/lib/sim/gravityWasm.threaded.mjs",
-    "build:wasm:all": "npm run build:wasm && npm run build:wasm:threaded"
+    "build:wasm:all": "npm run build:wasm && npm run build:wasm:threaded",
+    "bench:collide": "tsx test/collide.bench.ts",
+    "bench:gravity": "tsx test/gravity.bench.ts"
   },
   "dependencies": {
     "p5": "^1.9.3",
@@ -22,6 +24,7 @@
     "@types/node": "^20.12.5",
     "@vitejs/plugin-vue": "^5.0.4",
     "gh-pages": "^6.3.0",
+    "tsx": "^4.23.0",
     "vite": "^5.2.8"
   }
 }

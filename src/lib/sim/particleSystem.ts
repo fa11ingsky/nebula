@@ -47,10 +47,22 @@ export function createParticleSystem(capacity) {
         treeX: new Float32Array(capacity),
         treeY: new Float32Array(capacity),
         surface: new Array(capacity).fill(null),
+        // 1 for a particle that never moves (currently just the optional central mass -
+        // see spawn.ts) - kickAll/driftAll skip it outright, and collide.ts's
+        // resolveOverlap/resolveImpulse treat it as infinitely massive (all of a
+        // collision's position/velocity correction goes to the other body, none to this
+        // one), rather than merely being *very* heavy and moving a little anyway.
+        fixed: new Uint8Array(capacity),
     };
 }
 
-export function addParticle(system, x, y, mass, mergingEnabled = true) {
+/**
+ * radius defaults to the usual mass -> size mapping (sqrt(mass), so a body's rendered and
+ * collision size scales with how much it weighs) but can be overridden - see spawn.ts's
+ * central mass, which holds a large share of the system's total mass for gravity's sake
+ * without visually/physically reading as a giant body among ordinary-sized ones.
+ */
+export function addParticle(system, x, y, mass, mergingEnabled = true, fixed = false, radius = null) {
     const i = system.count;
     system.posX[i] = x;
     system.posY[i] = y;
@@ -59,13 +71,14 @@ export function addParticle(system, x, y, mass, mergingEnabled = true) {
     system.accX[i] = constants.GRAVITY.X;
     system.accY[i] = constants.GRAVITY.Y;
     system.mass[i] = mass;
-    system.radius[i] = Math.sqrt(mass);
+    system.radius[i] = radius !== null ? radius : Math.sqrt(mass);
     const color = getDisplayColorForMass(mass, mergingEnabled);
     system.colorR[i] = color[0];
     system.colorG[i] = color[1];
     system.colorB[i] = color[2];
     system.colorString[i] = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
     system.surface[i] = generateSurfaceFeatures(mass);
+    system.fixed[i] = fixed ? 1 : 0;
     system.count++;
 }
 
@@ -87,6 +100,7 @@ export function recolorAll(system, mergingEnabled) {
 
 export function kickAll(system, dt) {
     for (let i = 0; i < system.count; i++) {
+        if (system.fixed[i]) continue;
         system.velX[i] += system.accX[i] * dt;
         system.velY[i] += system.accY[i] * dt;
     }
@@ -95,8 +109,12 @@ export function kickAll(system, dt) {
 export function driftAll(system) {
     // No boundary: with nothing external ever acting on a particle, gravity and merges
     // (both exactly momentum-conserving) are the only things that can ever change total
-    // system momentum - so it stays exactly constant for the whole run.
+    // system momentum - so it stays exactly constant for the whole run. A fixed particle
+    // is the one deliberate exception: forcing it to never move acts as a momentum sink,
+    // the same way a real collision with an immovable wall doesn't conserve just the
+    // ball's own momentum - see particleSystem.ts's `fixed` field.
     for (let i = 0; i < system.count; i++) {
+        if (system.fixed[i]) continue;
         system.posX[i] += system.velX[i];
         system.posY[i] += system.velY[i];
     }
@@ -141,4 +159,5 @@ export function copyParticle(system, from, to) {
     system.colorB[to] = system.colorB[from];
     system.colorString[to] = system.colorString[from];
     system.surface[to] = system.surface[from];
+    system.fixed[to] = system.fixed[from];
 }

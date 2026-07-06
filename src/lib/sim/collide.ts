@@ -48,6 +48,11 @@ function softenedPairPE(system, i, j, dist) {
  * relative to each other while overlapping can't be pulled apart without inventing
  * energy, so it's left slightly overlapping for this frame (gravity's very next kick
  * will pull them into a real, energy-accounted approach/bounce next frame instead).
+ *
+ * If either body is fixed (particleSystem.ts - currently just the optional central mass),
+ * it's treated as infinitely massive for this split: see resolveImpulse's comment on
+ * invM1/invM2 for the derivation. All of the separation and all of the energy payment
+ * comes from the other body; the fixed one doesn't move and its velocity is untouched.
  */
 function resolveOverlap(system, i, j) {
     const dx = system.posX[j] - system.posX[i];
@@ -64,7 +69,9 @@ function resolveOverlap(system, i, j) {
 
     const m1 = system.mass[i];
     const m2 = system.mass[j];
-    const mu = 1 / (1 / m1 + 1 / m2); // reduced mass
+    const invM1 = system.fixed[i] ? 0 : 1 / m1;
+    const invM2 = system.fixed[j] ? 0 : 1 / m2;
+    const mu = 1 / (invM1 + invM2); // reduced mass (equals the other body's own mass if one side is fixed)
 
     const relVx = system.velX[i] - system.velX[j];
     const relVy = system.velY[i] - system.velY[j];
@@ -96,9 +103,12 @@ function resolveOverlap(system, i, j) {
     }
 
     // Move the pair apart along the normal, mass-weighted so the heavier body moves less
-    // and their combined center of mass doesn't shift.
-    const weight1 = m2 / (m1 + m2);
-    const weight2 = m1 / (m1 + m2);
+    // and their combined center of mass doesn't shift - weight1 = invM1/(invM1+invM2) is
+    // algebraically identical to m2/(m1+m2) when neither body is fixed (multiply both
+    // terms by m1*m2 to see it), but also correctly goes to exactly 0 when body i is fixed
+    // (invM1=0), putting the entire shift on the other body instead of the usual split.
+    const weight1 = invM1 / (invM1 + invM2);
+    const weight2 = invM2 / (invM1 + invM2);
     const shift = targetDist - dist;
     system.posX[i] -= weight1 * shift * nx;
     system.posY[i] -= weight1 * shift * ny;
@@ -116,10 +126,10 @@ function resolveOverlap(system, i, j) {
     const vnNew = Math.sign(vn) * Math.sqrt(discriminant);
     const impulse = mu * (vn - vnNew);
 
-    system.velX[i] -= (impulse / m1) * nx;
-    system.velY[i] -= (impulse / m1) * ny;
-    system.velX[j] += (impulse / m2) * nx;
-    system.velY[j] += (impulse / m2) * ny;
+    system.velX[i] -= impulse * invM1 * nx;
+    system.velY[i] -= impulse * invM1 * ny;
+    system.velX[j] += impulse * invM2 * nx;
+    system.velY[j] += impulse * invM2 * ny;
 }
 
 /**
@@ -137,6 +147,14 @@ function resolveOverlap(system, i, j) {
  * moment of impact, using the new velocity - otherwise the bounce would only visibly take
  * effect a full frame late, since position was already fully drifted at the old velocity
  * before this function runs.
+ *
+ * If either body is fixed (particleSystem.ts - currently just the optional central mass),
+ * it's treated as infinitely massive: 1/m becomes 0 for that body (invM1/invM2 below), the
+ * classic "collision with an immovable wall" limit. Taking the general impulse formula
+ * impulse = (1+e)*vn / (1/m1 + 1/m2) to that limit for body i gives
+ * impulse = (1+e)*vn*m2 exactly, so the fixed body's own velocity term (impulse/m1, i.e.
+ * impulse*invM1) is exactly 0 - not approximately, since invM1 is exactly 0, not just a
+ * very large m1 - while the other body gets the full, standard "bounce off a wall" result.
  */
 function resolveImpulse(system, i, j, nx, ny, remainingT) {
     const relVxIJ = system.velX[i] - system.velX[j];
@@ -145,17 +163,19 @@ function resolveImpulse(system, i, j, nx, ny, remainingT) {
 
     const m1 = system.mass[i];
     const m2 = system.mass[j];
-    const impulse = ((1 + constants.COLLISION_RESTITUTION) * vn) / (1 / m1 + 1 / m2);
+    const invM1 = system.fixed[i] ? 0 : 1 / m1;
+    const invM2 = system.fixed[j] ? 0 : 1 / m2;
+    const impulse = ((1 + constants.COLLISION_RESTITUTION) * vn) / (invM1 + invM2);
 
     const oldVelXi = system.velX[i];
     const oldVelYi = system.velY[i];
     const oldVelXj = system.velX[j];
     const oldVelYj = system.velY[j];
 
-    const newVelXi = oldVelXi - (impulse / m1) * nx;
-    const newVelYi = oldVelYi - (impulse / m1) * ny;
-    const newVelXj = oldVelXj + (impulse / m2) * nx;
-    const newVelYj = oldVelYj + (impulse / m2) * ny;
+    const newVelXi = oldVelXi - impulse * invM1 * nx;
+    const newVelYi = oldVelYi - impulse * invM1 * ny;
+    const newVelXj = oldVelXj + impulse * invM2 * nx;
+    const newVelYj = oldVelYj + impulse * invM2 * ny;
 
     system.velX[i] = newVelXi;
     system.velY[i] = newVelYi;
