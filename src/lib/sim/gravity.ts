@@ -15,7 +15,10 @@ let wasmReady = false;
 let wasmMaxParticles = 0;
 let wasmPosXOffset = 0, wasmPosYOffset = 0, wasmMassOffset = 0, wasmRadiusOffset = 0;
 let wasmAccXOffset = 0, wasmAccYOffset = 0;
+let wasmVelXOffset = 0, wasmVelYOffset = 0;
 let wasmCandidateBufferOffset = 0;
+let wasmCandidateBatchBufferOffset = 0, wasmCandidateCountsOffset = 0;
+let wasmMaxCandidatesPerParticle = 0;
 let wasmThreaded = false;
 
 /**
@@ -64,7 +67,12 @@ export async function initGravityWasm() {
     wasmRadiusOffset = wasmModule._get_radius_ptr() >> 2;
     wasmAccXOffset = wasmModule._get_acc_x_ptr() >> 2;
     wasmAccYOffset = wasmModule._get_acc_y_ptr() >> 2;
+    wasmVelXOffset = wasmModule._get_vel_x_ptr() >> 2;
+    wasmVelYOffset = wasmModule._get_vel_y_ptr() >> 2;
     wasmCandidateBufferOffset = wasmModule._get_candidate_buffer_ptr() >> 2;
+    wasmCandidateBatchBufferOffset = wasmModule._get_candidate_batch_buffer_ptr() >> 2;
+    wasmCandidateCountsOffset = wasmModule._get_candidate_counts_ptr() >> 2;
+    wasmMaxCandidatesPerParticle = wasmModule._get_max_candidates_per_particle();
     wasmReady = true;
 }
 
@@ -117,6 +125,40 @@ export function findNearbyWasm(system, i, searchRadius, out) {
     const candidates = wasmModule.HEAP32.subarray(wasmCandidateBufferOffset, wasmCandidateBufferOffset + count);
     for (let k = 0; k < count; k++) {
         out.push(candidates[k]);
+    }
+}
+
+/**
+ * Runs the broad-phase search for every particle in one call, split across threads exactly
+ * like computeGravityWasm splits the force traversal - see gravity.cpp's
+ * find_all_collision_candidates for why this (not the JS-side swept-collision math that
+ * follows it) turned out to be the majority of collide.ts's frame cost, and so the piece
+ * worth parallelizing. Must be called after buildCollisionTreeWasm this frame - it reuses
+ * that same tree, only adding velocity data (needed for each particle's own speed, which
+ * factors into its search radius the same way collide.ts's per-particle path always has).
+ * Results are read back per particle via getCollisionCandidatesWasm, not returned here.
+ */
+export function findAllCollisionCandidatesWasm(system, origVelX, origVelY, globalMaxRadius, gap) {
+    const count = system.count;
+    const heap = wasmModule.HEAPF32;
+    heap.set(origVelX.subarray(0, count), wasmVelXOffset);
+    heap.set(origVelY.subarray(0, count), wasmVelYOffset);
+    wasmModule._find_all_collision_candidates(count, globalMaxRadius, gap, constants.COLLISION_MAX_THREADS);
+}
+
+/**
+ * Reads particle i's candidates back from the batch find_all_collision_candidates wrote -
+ * a cheap local read (no WASM call), since the search itself already ran for every particle
+ * up front. Same broad-phase contract as findNearbyWasm: a superset of the true answer,
+ * capped at get_max_candidates_per_particle() per particle (see gravity.cpp's
+ * MAX_CANDIDATES_PER_PARTICLE) - degrades gracefully rather than growing unbounded.
+ */
+export function getCollisionCandidatesWasm(i, out) {
+    const heap = wasmModule.HEAP32;
+    const count = heap[wasmCandidateCountsOffset + i];
+    const start = wasmCandidateBatchBufferOffset + i * wasmMaxCandidatesPerParticle;
+    for (let k = 0; k < count; k++) {
+        out.push(heap[start + k]);
     }
 }
 

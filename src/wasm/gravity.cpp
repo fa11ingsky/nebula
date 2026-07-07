@@ -58,6 +58,14 @@
 // density collision only means it resolves a frame later once the pair's still overlapping
 // on the next call, not a correctness failure.
 #define MAX_CANDIDATES 4096
+// Per-particle cap for find_all_collision_candidates's batched/threaded search (distinct
+// from MAX_CANDIDATES above, which bounds one single-particle query's shared buffer) -
+// each particle gets its own fixed slot of this size in g_candidateBatchBuffer so threads
+// can write concurrently with zero synchronization, at the cost of reserving this many
+// ints per particle whether it needs them or not. 128 is comfortably above the worst case
+// actually measured (a single particle in an extremely dense central-mass cluster showed
+// ~141 real candidates before this feature existed) - see collide.ts's findAllCollisionCandidatesWasm.
+#define MAX_CANDIDATES_PER_PARTICLE 128
 
 // --- Particle data: the JS/WASM boundary ---------------------------------------------
 // Input (JS writes these every frame before calling compute_gravity) and output (JS reads
@@ -72,6 +80,11 @@ static float g_accX[MAX_PARTICLES];
 static float g_accY[MAX_PARTICLES];
 static float g_treeX[MAX_PARTICLES];
 static float g_treeY[MAX_PARTICLES];
+// Only populated for find_all_collision_candidates - the per-particle search radius there
+// (radius + globalMaxRadius + gap + speed) needs each particle's own speed, computed from
+// its velocity, which nothing else in this file otherwise needs.
+static float g_velX[MAX_PARTICLES];
+static float g_velY[MAX_PARTICLES];
 
 // Output buffer for find_nearby_collision_candidates - a single shared buffer, overwritten
 // by each call, since collide.ts's JS loop calls this once per particle and always reads
@@ -79,6 +92,13 @@ static float g_treeY[MAX_PARTICLES];
 // from JS). Same reuse pattern as g_accX/g_accY: one persistent buffer, no per-call
 // allocation.
 static int32_t g_candidateBuffer[MAX_CANDIDATES];
+
+// Output for find_all_collision_candidates: every particle gets its own fixed-size slot
+// (MAX_CANDIDATES_PER_PARTICLE ints, at offset i*MAX_CANDIDATES_PER_PARTICLE) so the
+// per-particle search below can run across threads with no shared mutable state to
+// synchronize - each thread only ever writes to the slots for the particle range it owns.
+static int32_t g_candidateBatchBuffer[MAX_PARTICLES * MAX_CANDIDATES_PER_PARTICLE];
+static int32_t g_candidateCounts[MAX_PARTICLES];
 
 // order[] holds particle indices, reordered in place during the build so that every node's
 // members occupy a contiguous range [leafStart, leafStart+leafCount) - see partitionRange
@@ -415,14 +435,19 @@ static void computeGravityForRange(int32_t startI, int32_t endI, float thetaSq, 
     }
 }
 
-// --- Collision broad-phase (find_nearby_collision_candidates) -----------------------
+// --- Collision broad-phase (find_nearby_collision_candidates / find_all_collision_candidates) ---
 // Direct port of quadtree.ts's findNearbyParticles onto this file's partition-based tree:
 // collect every particle within searchRadius of particle i, pruning subtrees whose
 // bounding box can't possibly contain a point that close (closest-point-on-box test).
 // Unlike gravity's traversal, this never aggregates - collision needs exact candidate
 // indices, not a force approximation, so every node visit either prunes the whole subtree
 // or (for a leaf) adds its members directly.
-static int32_t findNearbyCollisionCandidates(int32_t i, float searchRadius) {
+//
+// Takes its output location as a parameter so the same core logic serves two callers: a
+// single on-demand query (find_nearby_collision_candidates, writing into the one shared
+// g_candidateBuffer) and the batched, multi-threaded sweep below (find_all_collision_candidates,
+// each particle writing into its own private slot so threads never contend).
+static int32_t findNearbyCollisionCandidatesInto(int32_t i, float searchRadius, int32_t* outBuffer, int32_t maxOut) {
     float px = g_posX[i];
     float py = g_posY[i];
     float searchRadiusSq = searchRadius * searchRadius;
@@ -451,10 +476,10 @@ static int32_t findNearbyCollisionCandidates(int32_t i, float searchRadius) {
         if (nodeChildren[node] == -1) {
             int32_t start = nodeLeafStart[node];
             int32_t cnt = nodeLeafCount[node];
-            for (int32_t k = 0; k < cnt && outCount < MAX_CANDIDATES; k++) {
+            for (int32_t k = 0; k < cnt && outCount < maxOut; k++) {
                 int32_t j = order[start + k];
                 if (j != i) {
-                    g_candidateBuffer[outCount++] = j;
+                    outBuffer[outCount++] = j;
                 }
             }
             node = nodeNext[node];
@@ -464,6 +489,27 @@ static int32_t findNearbyCollisionCandidates(int32_t i, float searchRadius) {
     }
 
     return outCount;
+}
+
+static int32_t findNearbyCollisionCandidates(int32_t i, float searchRadius) {
+    return findNearbyCollisionCandidatesInto(i, searchRadius, g_candidateBuffer, MAX_CANDIDATES);
+}
+
+// Runs findNearbyCollisionCandidatesInto for a contiguous slice [startI, endI) of
+// particles - the unit of work find_all_collision_candidates hands to each thread. Same
+// "split by raw particle index" reasoning as computeGravityForRange: spawn order has no
+// lasting correlation with final spatial position, so a plain contiguous split already
+// spreads density (and so per-particle search cost) evenly across threads on average.
+// Race-free by construction: each particle writes only to its own reserved slot in
+// g_candidateBatchBuffer, and only ever reads the (already fully built, never mutated
+// during this phase) tree - the same read-only-tree guarantee applyTreeGravity relies on.
+static void findAllCollisionCandidatesForRange(int32_t startI, int32_t endI, float globalMaxRadius, float gap) {
+    for (int32_t i = startI; i < endI; i++) {
+        float speed = sqrtf(g_velX[i] * g_velX[i] + g_velY[i] * g_velY[i]);
+        float searchRadius = g_radius[i] + globalMaxRadius + gap + speed;
+        int32_t* slot = g_candidateBatchBuffer + i * MAX_CANDIDATES_PER_PARTICLE;
+        g_candidateCounts[i] = findNearbyCollisionCandidatesInto(i, searchRadius, slot, MAX_CANDIDATES_PER_PARTICLE);
+    }
 }
 
 extern "C" {
@@ -479,9 +525,14 @@ EMSCRIPTEN_KEEPALIVE float* get_mass_ptr() { return g_mass; }
 EMSCRIPTEN_KEEPALIVE float* get_radius_ptr() { return g_radius; }
 EMSCRIPTEN_KEEPALIVE float* get_acc_x_ptr() { return g_accX; }
 EMSCRIPTEN_KEEPALIVE float* get_acc_y_ptr() { return g_accY; }
+EMSCRIPTEN_KEEPALIVE float* get_vel_x_ptr() { return g_velX; }
+EMSCRIPTEN_KEEPALIVE float* get_vel_y_ptr() { return g_velY; }
 EMSCRIPTEN_KEEPALIVE int32_t* get_candidate_buffer_ptr() { return g_candidateBuffer; }
+EMSCRIPTEN_KEEPALIVE int32_t* get_candidate_batch_buffer_ptr() { return g_candidateBatchBuffer; }
+EMSCRIPTEN_KEEPALIVE int32_t* get_candidate_counts_ptr() { return g_candidateCounts; }
 EMSCRIPTEN_KEEPALIVE int get_max_particles() { return MAX_PARTICLES; }
 EMSCRIPTEN_KEEPALIVE int get_max_candidates() { return MAX_CANDIDATES; }
+EMSCRIPTEN_KEEPALIVE int get_max_candidates_per_particle() { return MAX_CANDIDATES_PER_PARTICLE; }
 
 // Builds a fresh tree from whatever's currently sitting in g_posX/g_posY/g_mass/g_radius
 // (JS writes those via the pointers above before calling this) and fills g_accX/g_accY
@@ -590,9 +641,54 @@ EMSCRIPTEN_KEEPALIVE int debug_max_leaf_occupancy() {
 // Collects every particle within searchRadius of particle i into g_candidateBuffer (read
 // back via get_candidate_buffer_ptr) and returns how many were found. Must be called after
 // build_collision_tree, once per particle - see collide.ts's findNearbyWasm for the JS side
-// of this loop, and findNearbyCollisionCandidates above for the traversal itself.
+// of this loop, and findNearbyCollisionCandidates above for the traversal itself. Kept
+// around as the fallback for callers that want one particle's candidates on demand rather
+// than the whole swarm at once - find_all_collision_candidates below is what collide.ts's
+// main loop actually uses now.
 EMSCRIPTEN_KEEPALIVE int find_nearby_collision_candidates(int i, float searchRadius) {
     return findNearbyCollisionCandidates(i, searchRadius);
+}
+
+// Runs the broad-phase search for every particle in one call, splitting the work across
+// threads exactly like compute_gravity does for the force traversal - profiling showed
+// this search (not the JS-side swept-collision math/resolution that follows it) is the
+// majority of collide.ts's frame cost, and it has the same read-only-tree, write-only-to-
+// own-output shape that makes gravity's traversal safe to thread. Must be called after
+// build_collision_tree and after JS has copied current velocities into g_velX/g_velY (via
+// get_vel_x_ptr/get_vel_y_ptr) - searchRadius needs each particle's own speed the same way
+// collide.ts's single-particle path always has. Results land in g_candidateBatchBuffer,
+// one fixed-size slot per particle (get_candidate_batch_buffer_ptr,
+// get_max_candidates_per_particle) with per-particle counts in g_candidateCounts
+// (get_candidate_counts_ptr) - see collide.ts's findAllCollisionCandidatesWasm for the JS
+// side that reads this back.
+EMSCRIPTEN_KEEPALIVE void find_all_collision_candidates(int count, float globalMaxRadius, float gap, int maxThreads) {
+    if (count < 0 || count > MAX_PARTICLES) {
+        return;
+    }
+
+    unsigned int hwThreads = std::thread::hardware_concurrency();
+    int32_t threadCap = maxThreads < 1 ? 1 : maxThreads;
+    int32_t threadCount = hwThreads < 1 ? 1 : (int32_t)std::min(hwThreads, (unsigned int)threadCap);
+    if (threadCount > count) {
+        threadCount = count > 0 ? count : 1;
+    }
+
+    if (threadCount <= 1) {
+        findAllCollisionCandidatesForRange(0, count, globalMaxRadius, gap);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(threadCount);
+        int32_t chunk = (count + threadCount - 1) / threadCount;
+        for (int32_t t = 0; t < threadCount; t++) {
+            int32_t startI = t * chunk;
+            int32_t endI = std::min(startI + chunk, count);
+            if (startI >= endI) break;
+            workers.emplace_back(findAllCollisionCandidatesForRange, startI, endI, globalMaxRadius, gap);
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
 }
 
 } // extern "C"

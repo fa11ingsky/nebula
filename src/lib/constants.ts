@@ -79,6 +79,12 @@ export default {
     // other on the same cores. Has no effect at all on the non-threaded WASM build (always
     // runs sequentially there) or when the page isn't cross-origin isolated.
     GRAVITY_MAX_THREADS: 16,
+    // Same idea as GRAVITY_MAX_THREADS, but for collide.ts's broad-phase search (see
+    // gravity.cpp's find_all_collision_candidates) - kept separate since profiling showed
+    // this search, not gravity's own traversal, is actually the majority of a collision
+    // frame's cost, so it's the one most worth tuning independently if you're
+    // experimenting with thread counts on your own hardware.
+    COLLISION_MAX_THREADS: 16,
     // Safety cap on quadtree subdivision depth, in case many particles land on (almost) the
     // same point - without this, that would try to subdivide forever. Nodes deeper than this
     // just keep a flat list instead of recursing further.

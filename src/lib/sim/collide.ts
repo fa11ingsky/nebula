@@ -3,7 +3,7 @@
 // kinetic energy per COLLISION_RESTITUTION) instead of combining into one body.
 import constants from '../constants.ts';
 import { buildSpatialGrid, findNearbyInGrid } from './spatialGrid.ts';
-import { isSpatialWasmReady, getSpatialWasmMaxParticles, buildCollisionTreeWasm, findNearbyWasm } from './gravity.ts';
+import { isSpatialWasmReady, getSpatialWasmMaxParticles, buildCollisionTreeWasm, findAllCollisionCandidatesWasm, getCollisionCandidatesWasm } from './gravity.ts';
 
 // Snapshot of every particle's velocity at the moment this frame's drift actually ran,
 // reused across frames and grown as needed (same pattern as the quadtree's node store) -
@@ -222,9 +222,9 @@ function resolveImpulse(system, i, j, nx, ny, remainingT) {
  * reconstruction needs the frozen snapshot.
  *
  * Candidate lookup prefers the WASM tree (gravity.cpp's build_collision_tree/
- * find_nearby_collision_candidates - see that file's header comment) over the JS uniform
- * grid (spatialGrid.ts, kept as the fallback for when WASM isn't ready yet or the particle
- * count exceeds its fixed capacity). The grid was originally built to replace an earlier
+ * find_all_collision_candidates - see that file's header comment) over the JS uniform grid
+ * (spatialGrid.ts, kept as the fallback for when WASM isn't ready yet or the particle count
+ * exceeds its fixed capacity). The grid was originally built to replace an earlier
  * quadtree-based version of this search - a bounded-radius query a uniform grid answers in
  * a handful of direct cell lookups, versus a tree's O(log n) descent with pruning tests
  * paying for hierarchy the query doesn't need - but a fixed cell size doesn't adapt to
@@ -233,6 +233,14 @@ function resolveImpulse(system, i, j, nx, ny, remainingT) {
  * into an effectively O(n) scan for every particle in the dense region. A tree doesn't have
  * that failure mode (it just subdivides the dense region further), and WASM keeps it fast
  * even so.
+ *
+ * The WASM path runs the search for every particle in one batched, multi-threaded call
+ * (findAllCollisionCandidatesWasm) rather than once per particle - profiling showed this
+ * search, not the swept-collision math/resolution below, is the majority of a collision
+ * frame's cost, and it has the same read-only-tree, write-only-to-own-output shape that
+ * makes gravity's own traversal safe to split across threads. The JS grid fallback stays
+ * per-particle (findNearbyInGrid) - there's no thread pool to hand that off to on the JS
+ * side regardless.
  */
 export function collideParticles(system) {
     const count = system.count;
@@ -258,6 +266,10 @@ export function collideParticles(system) {
         if (system.radius[i] > globalMaxRadius) globalMaxRadius = system.radius[i];
     }
 
+    if (useWasm) {
+        findAllCollisionCandidatesWasm(system, origVelX, origVelY, globalMaxRadius, constants.COLLISION_SURFACE_GAP);
+    }
+
     const candidates = [];
     // Marks pairs already resolved this frame (packed as min*capacity+max, a unique
     // integer per unordered pair) so a pair found from both sides - once as i seeking j,
@@ -268,12 +280,15 @@ export function collideParticles(system) {
     const resolvedPairs = new Set();
 
     for (let i = 0; i < count; i++) {
-        const speedI = Math.sqrt(origVelX[i] * origVelX[i] + origVelY[i] * origVelY[i]);
         candidates.length = 0;
-        const searchRadius = system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI;
         if (useWasm) {
-            findNearbyWasm(system, i, searchRadius, candidates);
+            // Search radius (including this particle's own speed padding) was already
+            // computed inside find_all_collision_candidates - this is just reading back
+            // the result of that batched call, not making a fresh WASM call per particle.
+            getCollisionCandidatesWasm(i, candidates);
         } else {
+            const speedI = Math.sqrt(origVelX[i] * origVelX[i] + origVelY[i] * origVelY[i]);
+            const searchRadius = system.radius[i] + globalMaxRadius + constants.COLLISION_SURFACE_GAP + speedI;
             findNearbyInGrid(grid, system, i, searchRadius, candidates);
         }
 
