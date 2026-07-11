@@ -176,18 +176,25 @@ function growInstanceBuffer(device, oldBuffer, neededFloats, usage) {
  * (already-dedicated-to-WebGPU) canvas. Returns null if anything in the chain fails
  * (adapter/device request, pipeline compilation) so the caller can fall back to
  * Canvas2D instead of leaving the app in a half-initialized state.
+ *
+ * `existingDevice` lets the GPU-physics mode (webgpuSim.ts) share one device between
+ * compute and rendering - required for the render pipeline to read the sim's position
+ * buffer directly (GPU buffers are never shareable across devices). A renderer built on
+ * a caller-owned device won't destroy it in destroyWebGPURenderer.
  */
-export async function createWebGPURenderer(canvas) {
+export async function createWebGPURenderer(canvas, existingDevice = null) {
     if (!navigator.gpu) {
         return null;
     }
 
     let adapter;
-    let device;
+    let device = existingDevice;
     try {
-        adapter = await navigator.gpu.requestAdapter();
-        if (!adapter) return null;
-        device = await adapter.requestDevice();
+        if (!device) {
+            adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return null;
+            device = await adapter.requestDevice();
+        }
     } catch {
         return null;
     }
@@ -284,9 +291,15 @@ export async function createWebGPURenderer(canvas) {
 
     const renderer = {
         device,
+        ownsDevice: !existingDevice,
         context,
         format,
         canvas,
+        // GPU-physics mode (see attachSimBuffers): a pipeline that reads particle
+        // positions straight from webgpuSim.ts's storage buffer - zero per-frame copies.
+        simPipeline: null,
+        simBindGroup: null,
+        simCount: 0,
         cameraBuffer,
         crosshairCenterBuffer,
         backgroundSampler,
@@ -458,6 +471,140 @@ export function renderWebGPUFrame(renderer, system, explosions, camera, crosshai
     device.queue.submit([encoder.finish()]);
 }
 
+/**
+ * Builds the GPU-physics render path: an instanced circle pipeline whose per-particle
+ * position comes straight from the sim's storage buffer via instance_index (radius/color
+ * from the sim's static color buffer) - no vertex-buffer fill, no CPU copy, ever. Called
+ * once per sim (re)creation; the particle count and small-particle rendering constants
+ * are baked into the shader.
+ *
+ * At the particle counts this path exists for (up to 1M), individual radii drop well
+ * below a pixel (radius = sqrt(MAX_MASS/count) ~ 0.02px at 1M) - rasterizing those
+ * faithfully would draw nothing. Rendered size clamps to half a pixel and blending is
+ * additive, so dense regions read as a brightening density field (the same practical
+ * choice the native renderer makes via its metaball field accumulation, reduced to its
+ * cheapest form).
+ */
+export function attachSimBuffers(renderer, sim) {
+    const device = renderer.device;
+    const alpha = sim.count > 100000 ? 0.3 : 1.0;
+    const shader = /* wgsl */ `
+struct Camera {
+    offset: vec2<f32>,
+    canvasSize: vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<storage, read> particlePos: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> colorRadius: array<vec4<f32>>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) localPos: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) inst: u32) -> VertexOutput {
+    var corners = array<vec2<f32>, 4>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(-1.0, 1.0),
+        vec2<f32>(1.0, 1.0),
+    );
+    let corner = corners[vertexIndex];
+    let cr = colorRadius[inst];
+    let radius = max(cr.w, 0.5);
+    let worldPos = particlePos[inst] + camera.offset + corner * radius;
+    let ndcX = (worldPos.x / camera.canvasSize.x) * 2.0 - 1.0;
+    let ndcY = 1.0 - (worldPos.y / camera.canvasSize.y) * 2.0;
+    var out: VertexOutput;
+    out.position = vec4<f32>(ndcX, ndcY, 0.0, 1.0);
+    out.localPos = corner;
+    out.color = vec4<f32>(cr.rgb, ${alpha});
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if (length(in.localPos) > 1.0) {
+        discard;
+    }
+    return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+}
+`;
+    const module = device.createShaderModule({ code: shader });
+    renderer.simPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs_main' },
+        fragment: {
+            module,
+            entryPoint: 'fs_main',
+            targets: [{
+                format: renderer.format,
+                blend: {
+                    color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+                    alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+                },
+            }],
+        },
+        primitive: { topology: 'triangle-strip' },
+    });
+    renderer.simBindGroup = device.createBindGroup({
+        layout: renderer.simPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: renderer.cameraBuffer } },
+            { binding: 1, resource: { buffer: sim.posBuf } },
+            { binding: 2, resource: { buffer: sim.colorRadiusBuf } },
+        ],
+    });
+    renderer.simCount = sim.count;
+}
+
+/**
+ * Draws one GPU-physics frame straight from the sim's buffers - the counterpart to
+ * renderWebGPUFrame for when the particle state lives on the GPU (no explosions: the
+ * GPU pipeline is bounce-only, merges never happen there).
+ */
+export function renderWebGPUSimFrame(renderer, camera, crosshairVisible) {
+    if (!renderer.simPipeline) return;
+    const device = renderer.device;
+
+    const cameraData = new Float32Array([camera.offsetX, camera.offsetY, renderer.canvas.width, renderer.canvas.height]);
+    device.queue.writeBuffer(renderer.cameraBuffer, 0, cameraData.buffer);
+
+    const encoder = device.createCommandEncoder();
+    const view = renderer.context.getCurrentTexture().createView();
+    const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+            view,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: 'clear',
+            storeOp: 'store',
+        }],
+    });
+
+    if (renderer.backgroundBindGroup) {
+        pass.setPipeline(renderer.backgroundPipeline);
+        pass.setBindGroup(0, renderer.backgroundBindGroup);
+        pass.draw(4);
+    }
+
+    pass.setPipeline(renderer.simPipeline);
+    pass.setBindGroup(0, renderer.simBindGroup);
+    pass.draw(4, renderer.simCount);
+
+    if (crosshairVisible) {
+        const centerData = new Float32Array([camera.comX, camera.comY]);
+        device.queue.writeBuffer(renderer.crosshairCenterBuffer, 0, centerData.buffer);
+        pass.setPipeline(renderer.crosshairPipeline);
+        pass.setBindGroup(0, renderer.crosshairBindGroup);
+        pass.draw(4);
+    }
+
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+}
+
 /** Releases GPU resources - call when switching away from this renderer. */
 export function destroyWebGPURenderer(renderer) {
     if (renderer.backgroundTexture) renderer.backgroundTexture.destroy();
@@ -465,5 +612,9 @@ export function destroyWebGPURenderer(renderer) {
     if (renderer.explosionBuffer) renderer.explosionBuffer.destroy();
     renderer.cameraBuffer.destroy();
     renderer.crosshairCenterBuffer.destroy();
-    renderer.device.destroy();
+    // A shared device belongs to the GPU-physics sim's lifecycle, not this renderer's -
+    // destroying it here would kill the compute pipeline mid-flight.
+    if (renderer.ownsDevice) {
+        renderer.device.destroy();
+    }
 }

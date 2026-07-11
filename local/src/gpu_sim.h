@@ -32,6 +32,7 @@
 #include <vector>
 #include "particle_system.h"
 #include "pm_gravity.h"
+#include "constants.h"
 
 struct GpuSim {
     // Particle SSBOs
@@ -216,9 +217,11 @@ struct GpuSim {
                  "#define TREE_SOFT %.9g\n"
                  "#define RESTITUTION %.9g\n"
                  "#define GAP %.9g\n"
-                 "#define FP_SCALE %.1f\n",
+                 "#define FP_SCALE %.1f\n"
+                 "#define TREE_SOFT_CAP2 %.9g\n",
                  gridN, (int32_t)log2f((float)gridN), gridN / 2, MAX_PER_CELL, tableSize,
-                 pmG, pairSoft, treeG, treeSoft, restitution, gap, DENSITY_FIXED_POINT_SCALE);
+                 pmG, pairSoft, treeG, treeSoft, restitution, gap, DENSITY_FIXED_POINT_SCALE,
+                 constants::GRAVITY_SOFTENING_MAX_LENGTH * constants::GRAVITY_SOFTENING_MAX_LENGTH);
         std::string h = header;
 
         progIntegrate = compileProgram(h + R"GLSL(
@@ -276,9 +279,12 @@ layout(std430, binding = 7) buffer NewContacts { uint newContacts[]; };
 uniform uint count; uniform vec2 binOrigin; uniform float cellSize; uniform ivec2 cellDims;
 uniform float dt; uniform float maxRadius;
 
+// Capped softening, matching collide.h's softenedPairPE exactly (see constants.h's
+// GRAVITY_SOFTENING_MAX_LENGTH) - the overlap energy budget must price PE in the same
+// field the CPU path uses or the two paths' collision behavior diverges.
 float pairPE(float mi, float mj, float ri, float rj, float dist) {
     float combR = ri + rj;
-    float sd = dist * dist + combR * combR * TREE_SOFT;
+    float sd = dist * dist + min(combR * combR * TREE_SOFT, TREE_SOFT_CAP2);
     return -(TREE_G * mi * mj) / sqrt(sd);
 }
 
@@ -380,7 +386,7 @@ void main() {
                 if (avail >= fullCost) target = touch;
                 else {
                     float combR = ri + rj;
-                    float softSq = combR * combR * TREE_SOFT;
+                    float softSq = min(combR * combR * TREE_SOFT, TREE_SOFT_CAP2);
                     float gm = TREE_G * mi * mj;
                     float k = 1.0 / sqrt(dist * dist + softSq) - avail / gm;
                     target = k <= 0.0 ? touch : sqrt(max(1.0 / (k * k) - softSq, 0.0));

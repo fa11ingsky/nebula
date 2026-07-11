@@ -19,9 +19,9 @@
                 <input type="checkbox" :checked="centralMassEnabled" @change="toggleCentralMass()" />
                 Central Mass
             </label>
-            <label class="settings-row">
-                <input type="checkbox" :checked="mergingEnabled" @change="toggleMerging()" />
-                Enable Merging
+            <label class="settings-row" :class="{ disabled: gravitySolver === 'gpu' }">
+                <input type="checkbox" :checked="mergingEnabled" @change="toggleMerging()" :disabled="gravitySolver === 'gpu'" />
+                Enable Merging{{ gravitySolver === 'gpu' ? ' (not on GPU)' : '' }}
             </label>
             <label class="settings-row">
                 <input type="checkbox" v-model="debugPanelVisible" />
@@ -31,9 +31,9 @@
                 <input type="checkbox" v-model="texturesEnabled" :disabled="useWebGpu" />
                 Enable Textures{{ useWebGpu ? ' (Canvas2D only)' : '' }}
             </label>
-            <label class="settings-row" v-if="webgpuSupported">
-                <input type="checkbox" :checked="useWebGpu" @change="toggleRenderer()" />
-                Use WebGPU Rendering
+            <label class="settings-row" v-if="webgpuSupported" :class="{ disabled: gravitySolver === 'gpu' }">
+                <input type="checkbox" :checked="useWebGpu" @change="toggleRenderer()" :disabled="gravitySolver === 'gpu'" />
+                Use WebGPU Rendering{{ gravitySolver === 'gpu' ? ' (required by GPU solver)' : '' }}
             </label>
             <label class="settings-row">
                 <input type="checkbox" v-model="crosshairVisible" />
@@ -43,6 +43,22 @@
                 <input type="checkbox" v-model="explosionsEnabled" />
                 Show Explosions
             </label>
+
+            <div class="settings-group">
+                <div class="settings-label">Gravity Solver</div>
+                <label class="settings-row">
+                    <input type="radio" name="gravitySolver" :checked="gravitySolver === 'tree'" @change="setGravitySolver('tree')" />
+                    Barnes-Hut Tree (1/r&sup2;)
+                </label>
+                <label class="settings-row">
+                    <input type="radio" name="gravitySolver" :checked="gravitySolver === 'pm'" @change="setGravitySolver('pm')" />
+                    Particle Mesh (true 2D, CPU)
+                </label>
+                <label class="settings-row" v-if="webgpuSupported">
+                    <input type="radio" name="gravitySolver" :checked="gravitySolver === 'gpu'" @change="setGravitySolver('gpu')" />
+                    Particle Mesh + Collisions (WebGPU)
+                </label>
+            </div>
 
             <div class="settings-group">
                 <div class="settings-label">Angular Momentum</div>
@@ -134,6 +150,10 @@
                 gravitationalConstant: constants.GRAVITATIONAL_CONSTANT,
                 totalParticles: constants.TOTAL_PARTICLES,
                 barnesHutTheta: constants.BARNES_HUT_THETA,
+                // 'tree' | 'pm' | 'gpu' - see constants.ts's GRAVITY_SOLVER comment. The
+                // 'gpu' choice implies (and locks) the WebGPU rendering backend: physics
+                // and rendering share one GPU device and draw from the same buffers.
+                gravitySolver: constants.GRAVITY_SOLVER,
                 // Just the option lists for the settings panel's radio groups - defined in
                 // constants.ts so adding/removing choices doesn't need a template change.
                 angularMomentumOptions: constants.ANGULAR_MOMENTUM_OPTIONS,
@@ -249,6 +269,14 @@
                         this.potentialEnergy = msg.potentialEnergy;
                         this.fps = msg.fps;
                         this.gravityBackend = msg.gravityBackend;
+                    } else if (msg.type === 'gravityModeFallback') {
+                        // The worker couldn't bring up the requested solver (WebGPU device
+                        // or pipeline failure) and already switched itself - reflect that
+                        // in the settings radio rather than showing a solver that isn't
+                        // actually running.
+                        console.error(`GPU gravity solver unavailable - falling back to '${msg.mode}'.`);
+                        this.gravitySolver = msg.mode;
+                        constants.GRAVITY_SOLVER = msg.mode;
                     } else if (msg.type === 'rendererSwitchFailed') {
                         // Shouldn't normally happen (the settings checkbox only appears
                         // after its own support check succeeds), but if the worker's
@@ -345,6 +373,23 @@
                     value,
                     centralMassEnabled: this.centralMassEnabled,
                 });
+            },
+            setGravitySolver(value) {
+                this.gravitySolver = value;
+                constants.GRAVITY_SOLVER = value;
+                // Mode first, then (if needed) the renderer switch: the worker processes
+                // messages in order, so when the new WebGPU canvas arrives the worker
+                // already knows to build its renderer on the physics pipeline's shared
+                // device rather than requesting its own.
+                this.worker?.postMessage({
+                    type: 'setGravityMode',
+                    mode: value,
+                    centralMassEnabled: this.centralMassEnabled,
+                });
+                if (value === 'gpu' && !this.useWebGpu) {
+                    this.useWebGpu = true;
+                    this.switchRenderer('webgpu');
+                }
             },
             setBarnesHutTheta(value) {
                 this.barnesHutTheta = value;

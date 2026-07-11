@@ -62,7 +62,7 @@ export function createParticleSystem(capacity) {
  * central mass, which holds a large share of the system's total mass for gravity's sake
  * without visually/physically reading as a giant body among ordinary-sized ones.
  */
-export function addParticle(system, x, y, mass, mergingEnabled = true, fixed = false, radius = null) {
+export function addParticle(system, x, y, mass, mergingEnabled = true, fixed = false, radius = null, lite = false) {
     const i = system.count;
     system.posX[i] = x;
     system.posY[i] = y;
@@ -76,8 +76,18 @@ export function addParticle(system, x, y, mass, mergingEnabled = true, fixed = f
     system.colorR[i] = color[0];
     system.colorG[i] = color[1];
     system.colorB[i] = color[2];
-    system.colorString[i] = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
-    system.surface[i] = generateSurfaceFeatures(mass);
+    // `lite` skips the Canvas2D-only cosmetics (a color string and a surface-feature
+    // object per particle) - at the GPU solver's million-particle counts those are a
+    // million heap allocations that no code path would ever read: the GPU solver requires
+    // the WebGPU render backend, which draws from raw color bytes and never touches
+    // either field.
+    if (lite) {
+        system.colorString[i] = '';
+        system.surface[i] = null;
+    } else {
+        system.colorString[i] = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+        system.surface[i] = generateSurfaceFeatures(mass);
+    }
     system.fixed[i] = fixed ? 1 : 0;
     system.count++;
 }

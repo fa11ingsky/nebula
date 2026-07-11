@@ -5,6 +5,7 @@ import { kickAll, driftAll, resetAccelerationAll } from './particleSystem.ts';
 import { mergeParticles } from './merge.ts';
 import { collideParticles } from './collide.ts';
 import { computeGravity } from './gravity.ts';
+import { computeGravityPM } from './pmGravity.ts';
 import { displayBody } from './particleRender.ts';
 
 export { spawnParticles } from './spawn.ts';
@@ -19,9 +20,16 @@ export { initGravityWasm, getGravityBackendLabel } from './gravity.ts';
  * instead of combining into one - momentum- and energy-conserving elastic impulses keep
  * them from actually overlapping, so the swarm jostles into tight, dense clusters
  * wherever mass concentrates instead of consolidating into fewer, larger bodies over time.
+ *
+ * `pm` (optional) switches the gravity solve from the Barnes-Hut tree to the Particle-Mesh
+ * solver (pmGravity.ts - the 'pm' entry in constants.GRAVITY_SOLVER_OPTIONS): pass
+ * { grid, table, scratch, G, pairSofteningFactor } built by the worker at spawn time.
+ * Everything else (leapfrog structure, merging, collision) is identical; only the force
+ * model changes. gravityTree is null in that case - PM has no tree for the energy readout
+ * to reuse (energy.ts builds its own fallback on demand).
  * @returns {{state: object, gravityTree: object}}
  */
-export function stepSimulation(system, explosions, mergingEnabled) {
+export function stepSimulation(system, explosions, mergingEnabled, pm = null) {
     // Leapfrog ("kick-drift-kick") integration: half-kick with the acceleration already
     // sitting on each particle from the end of last frame, drift positions, recompute
     // gravity at the new positions, then apply the second half-kick. Same one gravity
@@ -29,7 +37,7 @@ export function stepSimulation(system, explosions, mergingEnabled) {
     kickAll(system, 0.5);
     driftAll(system);
 
-    let gravityTree;
+    let gravityTree = null;
     if (mergingEnabled) {
         // Merges use their own quadtree built from pre-merge positions, and don't touch
         // acceleration at all - gravity is applied separately, right after. On frames where
@@ -38,7 +46,15 @@ export function stepSimulation(system, explosions, mergingEnabled) {
         // rebuild.
         const mergeResult = mergeParticles(system, explosions);
         resetAccelerationAll(system);
-        gravityTree = computeGravity(system, mergeResult.anyMerged ? null : mergeResult.tree);
+        if (pm) {
+            // The PM mesh solve zeroes and rebuilds acceleration itself (see
+            // computeGravityPMMesh) - the constant external GRAVITY field
+            // resetAccelerationAll just seeded gets overwritten, which only matters if
+            // GRAVITY.X/Y is ever set nonzero (it defaults to zero).
+            computeGravityPM(system, pm.grid, pm.table, pm.G, pm.pairSofteningFactor, pm.scratch);
+        } else {
+            gravityTree = computeGravity(system, mergeResult.anyMerged ? null : mergeResult.tree);
+        }
     } else {
         // Collision resolution builds its own tree for neighbor search (collide.ts, backed
         // by gravity.cpp's WASM tree or, as a fallback, spatialGrid.ts's JS grid) and
@@ -48,7 +64,11 @@ export function stepSimulation(system, explosions, mergingEnabled) {
         // used; gravity always builds its own fresh one on the post-collision positions.
         collideParticles(system);
         resetAccelerationAll(system);
-        gravityTree = computeGravity(system, null);
+        if (pm) {
+            computeGravityPM(system, pm.grid, pm.table, pm.G, pm.pairSofteningFactor, pm.scratch);
+        } else {
+            gravityTree = computeGravity(system, null);
+        }
     }
 
     kickAll(system, 0.5);

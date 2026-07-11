@@ -73,7 +73,7 @@ function initializeAngularMomentum(system, targetL) {
  * original mass-gradient coloring rather than silently switching to white.
  * @returns {{state: object, worldCenter: {x: number, y: number}}}
  */
-export function spawnParticles(s, includeCentralMass, mergingEnabled = true) {
+export function spawnParticles(s, includeCentralMass, mergingEnabled = true, lite = false) {
     const capacity = constants.TOTAL_PARTICLES + (includeCentralMass ? 1 : 0);
     const system = createParticleSystem(capacity);
 
@@ -85,7 +85,7 @@ export function spawnParticles(s, includeCentralMass, mergingEnabled = true) {
 
     for (let i = 0; i < constants.TOTAL_PARTICLES; i++) {
         const spawn = randomSpawnPoint(s, centerX, centerY, spawnRadius);
-        addParticle(system, spawn.x, spawn.y, particleMass, mergingEnabled);
+        addParticle(system, spawn.x, spawn.y, particleMass, mergingEnabled, false, null, lite);
     }
 
     if (includeCentralMass) {
@@ -96,7 +96,7 @@ export function spawnParticles(s, includeCentralMass, mergingEnabled = true) {
         // ordinary-sized particle rather than a giant sphere, and (with merging off, so
         // nothing ever changes mass or radius again after spawn - see merge.ts, the only
         // place that reassigns radius) this stays true for the entire session.
-        addParticle(system, centerX, centerY, centralMass, mergingEnabled, true, particleRadius);
+        addParticle(system, centerX, centerY, centralMass, mergingEnabled, true, particleRadius, lite);
     }
 
     initializeAngularMomentum(system, constants.TOTAL_ANGULAR_MOMENTUM);

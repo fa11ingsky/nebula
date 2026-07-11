@@ -55,11 +55,53 @@ export default {
     // lets particles collide and accrete into "planets" instead of either all plunging into
     // one blob (too little L) or all settling into wide, non-interacting orbits (too much L).
     TOTAL_ANGULAR_MOMENTUM: 95000,
+    // Which gravity solver runs each frame - see the settings panel's "Gravity Solver"
+    // group and simulation.worker.ts:
+    //   'tree' - Barnes-Hut quadtree (gravity.ts), the original path. ~1/r^2 force law.
+    //   'pm'   - Particle-Mesh on the CPU (pmGravity.ts, ported from the native app's
+    //            local/src/pm_gravity.h): FFT Poisson solve + P3M short-range correction.
+    //            A true-2D gravity model (~1/r force law) - different physics, not just a
+    //            faster path; see pmGravity.ts's header comment.
+    //   'gpu'  - the same PM+P3M model plus collision and integration, all as WebGPU
+    //            compute shaders (webgpuSim.ts, ported from local/src/gpu_sim.h).
+    //            Positions never leave GPU memory; this is the only solver that scales to
+    //            the 250k/1M particle-count options. Requires WebGPU; forces the WebGPU
+    //            render backend (physics and rendering share one GPU device/buffer).
+    GRAVITY_SOLVER: 'tree',
+    GRAVITY_SOLVER_OPTIONS: ['tree', 'pm', 'gpu'],
+    // PM gravity's own gravitational constant - the PM mesh solves a true 2D Poisson
+    // equation (~1/r force law, logarithmic potential), a different overall force scale at
+    // this app's mass/distance units than the tree's ~1/r^2 law, so it can't share
+    // GRAVITATIONAL_CONSTANT. This value was bisected in the native app to match the tree
+    // path's clustering rate at the default swarm. The GRAVITATIONAL_CONSTANT setting
+    // still applies as a multiplier on top (applied at spawn/init - PM modes bake G into
+    // their Green's table and calibration table, so mid-run changes take effect on
+    // Restart, unlike the tree path's immediate pickup).
+    PM_GRAVITATIONAL_CONSTANT: 0.02,
+    // How far out (in units of sqrt(cell area)) the P3M short-range correction reaches
+    // before the mesh alone is trusted. Cost scales with this SQUARED. Mirrors the native
+    // app's constants.h.
+    PM_P3M_CUTOFF_FACTOR: 4,
+    // The P3M direct-pair force's own close-in softening (combinedRadius^2 * this, added
+    // under the sqrt) - same role as GRAVITY_SOFTENING_FACTOR for the tree path.
+    PM_PAIR_SOFTENING_FACTOR: 1,
+    // Resolution of the one-time startup table that calibrates the P3M correction against
+    // whatever the mesh solve actually produces (see pmGravity.ts's calibrate).
+    PM_CALIBRATION_TABLE_SIZE: 64,
+    // Adaptive substepping for the 'gpu' solver (ported from the native app's main loop):
+    // per-frame substep count is derived from last frame's peak acceleration so close
+    // encounters get integrated finely without paying for it on calm frames. The safety
+    // factor bounds how far pure acceleration may move a particle in one substep, as a
+    // fraction of particle radius; MAX_SUBSTEPS caps the worst-case per-frame cost.
+    SUBSTEP_SAFETY_FACTOR: 0.5,
+    MAX_SUBSTEPS: 8,
     // Choices offered in the settings panel for each of these three - add/remove/reorder
     // entries here to change what shows up as radio options, no template changes needed.
     ANGULAR_MOMENTUM_OPTIONS: [10000, 50000, 95000, 150000],
     GRAVITATIONAL_CONSTANT_OPTIONS: [0.1, 0.5, 1, 2],
-    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000, 25000, 50000],
+    // The six-figure options are realistically only usable with the 'gpu' gravity solver
+    // (and its WebGPU rendering) - the tree/Canvas2D combination will crawl there.
+    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000, 25000, 50000, 100000, 250000, 1000000],
     // Barnes-Hut opening angle: a distant cluster of particles is treated as one point mass
     // at its center of mass once (node size / distance) < this, instead of visiting every
     // particle inside it individually. 0.5 is the classic Barnes & Hut (1986) value - a good

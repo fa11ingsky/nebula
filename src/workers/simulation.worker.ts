@@ -34,7 +34,9 @@
 // its existing one.
 import constants from '../lib/constants.ts';
 import * as simulation from '../lib/sim/simulation.ts';
-import { createWebGPURenderer, resizeWebGPURenderer, setWebGPUBackground, renderWebGPUFrame, destroyWebGPURenderer } from '../lib/sim/webgpuRenderer.ts';
+import { createWebGPURenderer, resizeWebGPURenderer, setWebGPUBackground, renderWebGPUFrame, renderWebGPUSimFrame, attachSimBuffers, destroyWebGPURenderer } from '../lib/sim/webgpuRenderer.ts';
+import { createPMGrid, createPMScratch, calibratePMShortRangeTable } from '../lib/sim/pmGravity.ts';
+import { createWebGPUSim, autoGridSize } from '../lib/sim/webgpuSim.ts';
 
 // Fire-and-forget: gravity.ts's computeGravity checks readiness itself and transparently
 // runs the plain JS Barnes-Hut path until this resolves, so nothing here needs to await it
@@ -55,6 +57,117 @@ let texturesEnabled = false;
 let crosshairVisible = false;
 let explosionsEnabled = false;
 let debugPanelVisible = false;
+
+// Which gravity solver runs each frame - 'tree' (Barnes-Hut, the original path), 'pm'
+// (CPU Particle-Mesh, pmGravity.ts) or 'gpu' (the full WebGPU physics pipeline,
+// webgpuSim.ts). See constants.ts's GRAVITY_SOLVER comment for what each one is.
+let gravityMode = constants.GRAVITY_SOLVER;
+// PM-mode state, rebuilt at every spawn: { grid, table, scratch, G, pairSofteningFactor }
+// handed to stepSimulation. The calibration table is cached across restarts (it only
+// depends on cell size / G / cutoff, not on the particles).
+let pmContext = null;
+const calibrationCache = new Map();
+const PM_CPU_GRID = 256;
+// GPU-mode state. The device is a lazily-created singleton shared between the physics
+// pipeline and the WebGPU renderer - buffers are never shareable across devices, and the
+// whole point is rendering straight from the physics position buffer.
+let gpuSim = null;
+let gpuDevicePromise = null;
+let gpuInitToken = 0; // invalidates an in-flight async init superseded by a newer reset
+// Center of mass in GPU mode comes from an occasional async position readback (an 8MB
+// round trip at 1M particles - deliberately ~once a second, never per frame).
+const gpuStats = { comX: 0, comY: 0, lastComRead: 0, comReadInFlight: false };
+
+function getGpuDevice() {
+    if (!gpuDevicePromise) {
+        gpuDevicePromise = (async () => {
+            if (!navigator.gpu) return null;
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return null;
+            return adapter.requestDevice();
+        })().catch(() => null);
+    }
+    return gpuDevicePromise;
+}
+
+function pmEffectiveG() {
+    // The GRAVITATIONAL_CONSTANT setting scales PM gravity too, on top of PM's own
+    // separately-tuned base constant (see constants.ts). Baked into the Green's table and
+    // calibration at spawn/init - mid-run changes take effect on Restart in PM/GPU modes.
+    return constants.PM_GRAVITATIONAL_CONSTANT * constants.GRAVITATIONAL_CONSTANT;
+}
+
+function getCalibratedTable(cellW, cellH, G) {
+    const rCut = constants.PM_P3M_CUTOFF_FACTOR * Math.sqrt(cellW * cellH);
+    const key = `${cellW}|${cellH}|${G}|${rCut}|${constants.PM_CALIBRATION_TABLE_SIZE}`;
+    let table = calibrationCache.get(key);
+    if (!table) {
+        table = calibratePMShortRangeTable(cellW, cellH, G, rCut, constants.PM_CALIBRATION_TABLE_SIZE);
+        calibrationCache.set(key, table);
+    }
+    return table;
+}
+
+function buildPMContext(worldW, worldH) {
+    const G = pmEffectiveG();
+    const grid = createPMGrid(PM_CPU_GRID, PM_CPU_GRID, worldW, worldH);
+    return {
+        grid,
+        table: getCalibratedTable(grid.cellWidth, grid.cellHeight, G),
+        scratch: createPMScratch(),
+        G,
+        pairSofteningFactor: constants.PM_PAIR_SOFTENING_FACTOR,
+    };
+}
+
+/**
+ * Builds the WebGPU physics pipeline for the just-spawned system. Async (device request,
+ * pipeline compilation) and guarded by gpuInitToken - a Restart mid-init just abandons
+ * the stale pipeline. On any failure this falls back to the CPU PM solver and tells the
+ * main thread so the settings radio reflects reality.
+ */
+async function initGpuSim() {
+    const token = ++gpuInitToken;
+    const spawnedState = state;
+    const worldW = p5Shim.width, worldH = p5Shim.height;
+    try {
+        const device = await getGpuDevice();
+        if (!device) throw new Error('WebGPU unavailable');
+        const G = pmEffectiveG();
+        const gridN = autoGridSize(spawnedState.count);
+        const sim = await createWebGPUSim(device, spawnedState, {
+            gridN,
+            worldW,
+            worldH,
+            pmG: G,
+            pairSofteningFactor: constants.PM_PAIR_SOFTENING_FACTOR,
+            treeG: constants.GRAVITATIONAL_CONSTANT,
+            treeSofteningFactor: constants.GRAVITY_SOFTENING_FACTOR,
+            restitution: constants.COLLISION_RESTITUTION,
+            surfaceGap: constants.COLLISION_SURFACE_GAP,
+            table: getCalibratedTable(worldW / gridN, worldH / gridN, G),
+            densityBlurThreshold: 2,
+            substepSafetyFactor: constants.SUBSTEP_SAFETY_FACTOR,
+            maxSubsteps: constants.MAX_SUBSTEPS,
+        });
+        if (token !== gpuInitToken) {
+            sim.destroy(); // a newer reset superseded this init while it was compiling
+            return;
+        }
+        gpuSim = sim;
+        gpuStats.comX = worldCenter.x;
+        gpuStats.comY = worldCenter.y;
+        if (renderBackend === 'webgpu' && gpuRenderer) {
+            attachSimBuffers(gpuRenderer, gpuSim);
+        }
+    } catch (err) {
+        console.error('WebGPU physics init failed, falling back to CPU Particle Mesh:', err);
+        if (token !== gpuInitToken) return;
+        gravityMode = 'pm';
+        postMessage({ type: 'gravityModeFallback', mode: 'pm' });
+        resetSim();
+    }
+}
 
 // 'canvas2d' (default) or 'webgpu' - see the module header comment above.
 let renderBackend = 'canvas2d';
@@ -104,9 +217,25 @@ const p5Shim = {
 
 function resetSim() {
     explosions = [];
-    const spawned = simulation.spawnParticles(p5Shim, centralMassEnabled, mergingEnabled);
+    // 'lite' skips per-particle Canvas2D cosmetics the GPU path can never use - see
+    // particleSystem.ts's addParticle. Matters at the million-particle counts the GPU
+    // solver exists for.
+    const lite = gravityMode === 'gpu';
+    const spawned = simulation.spawnParticles(p5Shim, centralMassEnabled, mergingEnabled, lite);
     state = spawned.state;
     worldCenter = spawned.worldCenter;
+
+    pmContext = null;
+    if (gpuSim) {
+        gpuSim.destroy();
+        gpuSim = null;
+    }
+    gpuInitToken++; // abandon any still-compiling previous GPU init
+    if (gravityMode === 'pm') {
+        pmContext = buildPMContext(p5Shim.width, p5Shim.height);
+    } else if (gravityMode === 'gpu') {
+        initGpuSim();
+    }
 }
 
 function renderFrame(com, offsetX, offsetY) {
@@ -155,6 +284,125 @@ function renderFrame(com, offsetX, offsetY) {
     ctx.restore();
 }
 
+function cpuTick() {
+    // One full leapfrog step (kick-drift-kick + merge detection + gravity) - see
+    // simulation.ts's stepSimulation. pmContext (non-null only in 'pm' mode) swaps the
+    // gravity solve from the Barnes-Hut tree to the Particle-Mesh solver.
+    const stepResult = simulation.stepSimulation(state, explosions, mergingEnabled, pmContext);
+    state = stepResult.state;
+    const gravityTree = stepResult.gravityTree;
+
+    if (explosionsEnabled) {
+        for (const explosion of explosions) {
+            explosion.update();
+        }
+        explosions = explosions.filter((explosion) => !explosion.isDone());
+    } else {
+        // Merges still happen (and still cost the same either way - collision flashes
+        // are purely cosmetic, never fed back into the physics), but with the setting
+        // off there's no point updating/aging/drawing whatever mergeParticles just
+        // pushed in - drop it immediately instead of letting it accumulate unbounded
+        // for the rest of the session.
+        explosions.length = 0;
+    }
+
+    // Camera follows the center of mass, which - with total momentum held at exactly
+    // zero - never moves on its own. Locking the view to it keeps the system centered
+    // on screen even while individual particles get flung outward by gravity. Only the
+    // particles/marker shift with the camera; the nebula backdrop is drawn unshifted,
+    // as if at infinity.
+    const com = simulation.computeCenterOfMass(state);
+    const offsetX = canvas.width / 2 - com.x;
+    const offsetY = canvas.height / 2 - com.y;
+
+    if (debugPanelVisible) {
+        // Relative to the FIXED spawn-time world center, not the live canvas
+        // dimensions the camera uses - reusing the camera's offset here was the
+        // original bug this measurement had to avoid: resizing the window changes
+        // canvas.width/height, which would silently redefine "center" for this
+        // reading with no particle having actually moved, masquerading as huge drift.
+        postMessage({
+            type: 'stats',
+            centerOfMass: { x: com.x - worldCenter.x, y: com.y - worldCenter.y },
+            // Reuses the tree gravity already built this frame rather than a third
+            // rebuild just for this readout. In PM mode there's no tree -
+            // computePotentialEnergy builds its own fallback on demand.
+            kineticEnergy: simulation.computeKineticEnergy(state),
+            potentialEnergy: simulation.computePotentialEnergy(state, gravityTree),
+            fps: smoothedFps,
+            gravityBackend: pmContext
+                ? `pm ${pmContext.grid.nx}x${pmContext.grid.ny} (js)`
+                : simulation.getGravityBackendLabel(),
+        });
+    }
+
+    renderFrame(com, offsetX, offsetY);
+}
+
+/**
+ * One GPU-mode frame: derive the substep count from last frame's (async-read) peak
+ * acceleration, encode every substep's full compute chain plus the 8-byte max-accel/speed
+ * readback into one command buffer, submit, and draw straight from the physics position
+ * buffer. The CPU never touches particle state here - the camera stays pinned to the
+ * spawn-time world center (the fixed central anchor of the periodic PM domain) instead of
+ * chasing a per-frame center of mass, which is only refreshed ~once a second from an
+ * async readback for the crosshair/debug panel.
+ */
+function gpuTick() {
+    if (!gpuSim || !rendererReady || !gpuRenderer || renderBackend !== 'webgpu') {
+        return; // still initializing (or mid renderer switch) - skip, don't stall
+    }
+
+    const substeps = gpuSim.computeSubsteps();
+    gpuSim.beginFrame(substeps);
+    const encoder = gpuSim.device.createCommandEncoder();
+    for (let s = 0; s < substeps; s++) {
+        gpuSim.encodeSubstep(encoder);
+    }
+    gpuSim.encodeReadback(encoder);
+    gpuSim.device.queue.submit([encoder.finish()]);
+    gpuSim.pollReadback();
+
+    const offsetX = canvas.width / 2 - worldCenter.x;
+    const offsetY = canvas.height / 2 - worldCenter.y;
+    renderWebGPUSimFrame(gpuRenderer, { offsetX, offsetY, comX: gpuStats.comX, comY: gpuStats.comY }, crosshairVisible);
+
+    const now = performance.now();
+    if ((debugPanelVisible || crosshairVisible) && !gpuStats.comReadInFlight && now - gpuStats.lastComRead > 1000) {
+        gpuStats.comReadInFlight = true;
+        gpuStats.lastComRead = now;
+        const forState = state;
+        gpuSim.readPositions().then((xy) => {
+            gpuStats.comReadInFlight = false;
+            if (state !== forState) return; // restarted while the readback was in flight
+            let totalMass = 0, cx = 0, cy = 0;
+            for (let i = 0; i < forState.count; i++) {
+                const m = forState.mass[i];
+                totalMass += m;
+                cx += m * xy[i * 2];
+                cy += m * xy[i * 2 + 1];
+            }
+            if (totalMass > 0) {
+                gpuStats.comX = cx / totalMass;
+                gpuStats.comY = cy / totalMass;
+            }
+        }).catch(() => { gpuStats.comReadInFlight = false; });
+    }
+
+    if (debugPanelVisible) {
+        postMessage({
+            type: 'stats',
+            centerOfMass: { x: gpuStats.comX - worldCenter.x, y: gpuStats.comY - worldCenter.y },
+            // Energy readouts need full CPU-side state - not worth an 8MB+ readback per
+            // second on top of the COM one. Reported as zero in GPU mode.
+            kineticEnergy: 0,
+            potentialEnergy: 0,
+            fps: smoothedFps,
+            gravityBackend: `pm ${gpuSim.gridN}x${gpuSim.gridN} (webgpu)`,
+        });
+    }
+}
+
 function tick() {
     if (!stopped && state) {
         const now = performance.now();
@@ -168,54 +416,11 @@ function tick() {
         lastTickTime = now;
         p5Shim.frameCount++;
 
-        // One full leapfrog step (kick-drift-kick + merge detection + gravity) - see
-        // simulation.ts's stepSimulation.
-        const stepResult = simulation.stepSimulation(state, explosions, mergingEnabled);
-        state = stepResult.state;
-        const gravityTree = stepResult.gravityTree;
-
-        if (explosionsEnabled) {
-            for (const explosion of explosions) {
-                explosion.update();
-            }
-            explosions = explosions.filter((explosion) => !explosion.isDone());
+        if (gravityMode === 'gpu') {
+            gpuTick();
         } else {
-            // Merges still happen (and still cost the same either way - collision flashes
-            // are purely cosmetic, never fed back into the physics), but with the setting
-            // off there's no point updating/aging/drawing whatever mergeParticles just
-            // pushed in - drop it immediately instead of letting it accumulate unbounded
-            // for the rest of the session.
-            explosions.length = 0;
+            cpuTick();
         }
-
-        // Camera follows the center of mass, which - with total momentum held at exactly
-        // zero - never moves on its own. Locking the view to it keeps the system centered
-        // on screen even while individual particles get flung outward by gravity. Only the
-        // particles/marker shift with the camera; the nebula backdrop is drawn unshifted,
-        // as if at infinity.
-        const com = simulation.computeCenterOfMass(state);
-        const offsetX = canvas.width / 2 - com.x;
-        const offsetY = canvas.height / 2 - com.y;
-
-        if (debugPanelVisible) {
-            // Relative to the FIXED spawn-time world center, not the live canvas
-            // dimensions the camera uses - reusing the camera's offset here was the
-            // original bug this measurement had to avoid: resizing the window changes
-            // canvas.width/height, which would silently redefine "center" for this
-            // reading with no particle having actually moved, masquerading as huge drift.
-            postMessage({
-                type: 'stats',
-                centerOfMass: { x: com.x - worldCenter.x, y: com.y - worldCenter.y },
-                // Reuses the tree gravity already built this frame rather than a third
-                // rebuild just for this readout.
-                kineticEnergy: simulation.computeKineticEnergy(state),
-                potentialEnergy: simulation.computePotentialEnergy(state, gravityTree),
-                fps: smoothedFps,
-                gravityBackend: simulation.getGravityBackendLabel(),
-            });
-        }
-
-        renderFrame(com, offsetX, offsetY);
     }
 
     // Workers have no requestAnimationFrame (it's tied to the window's render pipeline,
@@ -231,7 +436,10 @@ function tick() {
 
 async function switchToWebGPU(newCanvas, bitmap) {
     rendererReady = false;
-    const renderer = await createWebGPURenderer(newCanvas);
+    // GPU-physics mode shares one device between compute and rendering (buffers can't
+    // cross devices) - hand the renderer the sim's device if that mode is active.
+    const sharedDevice = gravityMode === 'gpu' ? await getGpuDevice() : null;
+    const renderer = await createWebGPURenderer(newCanvas, sharedDevice);
     if (!renderer) {
         // Shouldn't normally happen (Particles.vue only offers this path after its own
         // support check succeeds), but if the device/pipeline chain fails anyway, report
@@ -242,9 +450,22 @@ async function switchToWebGPU(newCanvas, bitmap) {
     }
     canvas = newCanvas;
     gpuRenderer = renderer;
+    // Whatever device the renderer ended up on becomes THE device for any later GPU
+    // physics init - the physics buffers must live on the renderer's device or its render
+    // pipeline can't read them. (When gravityMode was already 'gpu', sharedDevice above
+    // came from this same promise and this is a no-op.)
+    if (!gpuDevicePromise) {
+        gpuDevicePromise = Promise.resolve(renderer.device);
+    }
     if (bitmap) {
         setWebGPUBackground(gpuRenderer, bitmap);
         bitmap.close();
+    }
+    // If the physics pipeline finished initializing before the renderer did (the two are
+    // independently async), hook its buffers up now - initGpuSim does the same in the
+    // opposite arrival order.
+    if (gpuSim) {
+        attachSimBuffers(gpuRenderer, gpuSim);
     }
     renderBackend = 'webgpu';
     rendererReady = true;
@@ -321,6 +542,11 @@ self.onmessage = (event) => {
             // up explicitly.
             if (renderBackend === 'webgpu' && gpuRenderer) {
                 destroyWebGPURenderer(gpuRenderer);
+                // If that renderer owned the cached shared device, it just destroyed it -
+                // a later GPU-physics init must request a fresh one, not reuse a corpse.
+                if (gpuRenderer.ownsDevice) {
+                    gpuDevicePromise = null;
+                }
                 gpuRenderer = null;
             }
             if (msg.backend === 'webgpu') {
@@ -333,6 +559,15 @@ self.onmessage = (event) => {
 
         case 'resetSim': {
             centralMassEnabled = msg.centralMassEnabled;
+            resetSim();
+            break;
+        }
+
+        case 'setGravityMode': {
+            gravityMode = msg.mode;
+            centralMassEnabled = msg.centralMassEnabled;
+            // Solver state (PM grids, calibration, GPU pipeline) is built per spawn -
+            // switching solvers is always a restart, same as the particle-count setting.
             resetSim();
             break;
         }
