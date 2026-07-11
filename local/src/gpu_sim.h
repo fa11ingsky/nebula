@@ -10,8 +10,15 @@
 //
 // Numerical parity with the CPU path (pm_gravity.h / collide.h), and where it differs:
 //  - The mesh solve is the same algorithm end-to-end (same CIC weights, same radix-2 FFT
-//    math, same precomputed Green's table - uploaded from PMGrid::buildGreensTable - same
-//    central-difference gradient), so the CPU-calibrated P3M table stays valid on GPU.
+//    math, same central-difference gradient), INCLUDING the isolated (free-space)
+//    boundary treatment: FFT grids are zero-padded to 2x per axis (PAD_N) and multiplied
+//    by the same free-space kernel spectrum PMGrid::buildIsolatedKernelTable computes
+//    (uploaded pre-transposed), so there are no periodic image forces - see
+//    pm_gravity.h's header for the measured anisotropic-collapse artifact the periodic
+//    solve caused. The CPU-calibrated P3M table stays valid on GPU. The FFT row kernel
+//    runs 256 threads looping over its row's butterflies (one-thread-per-butterfly would
+//    exceed max workgroup size at padded 2048+ rows); shared memory per row is PAD_N * 8
+//    bytes = 32KB at the 2048 grid cap, exactly GL 4.3's guaranteed minimum.
 //  - Neighbor search uses a uniform grid instead of collide.h's tree: fixed-radius queries
 //    are exactly what uniform grids are best at, and tree traversal (pointer-chasing,
 //    divergent) is a poor fit for GPU warps. Cells overflowing MAX_PER_CELL drop the
@@ -165,25 +172,28 @@ struct GpuSim {
         clearUintBuffer(contactCountBufA);
         clearUintBuffer(contactCountBufB);
 
-        // --- Mesh buffers ---
-        size_t cells = (size_t)gridN * gridN;
-        densityGridBuf = makeSsbo(cells * 4);
-        gridReA = makeSsbo(cells * 4);
-        gridImA = makeSsbo(cells * 4);
-        gridReB = makeSsbo(cells * 4);
-        gridImB = makeSsbo(cells * 4);
-        forceBuf = makeSsbo(cells * 8);
+        // --- Mesh buffers, sized for the ZERO-PADDED (2x per axis) isolated-boundary
+        // solve - see pm_gravity.h's header for why padding is load-bearing, not waste ---
+        int32_t padN = gridN * 2;
+        size_t padCells = (size_t)padN * padN;
+        densityGridBuf = makeSsbo(padCells * 4);
+        gridReA = makeSsbo(padCells * 4);
+        gridImA = makeSsbo(padCells * 4);
+        gridReB = makeSsbo(padCells * 4);
+        gridImB = makeSsbo(padCells * 4);
+        forceBuf = makeSsbo(padCells * 8);
 
-        // Green's table, transposed at upload: the pipeline applies it between the two FFT
-        // axis passes, i.e. while the grid sits in transposed layout (see substep()).
-        cpuGrid.buildGreensTable(pmG);
-        std::vector<float> greensT(cells);
-        for (int32_t j = 0; j < gridN; j++) {
-            for (int32_t i = 0; i < gridN; i++) {
-                greensT[(size_t)i * gridN + j] = cpuGrid.greensScale[(size_t)j * gridN + i];
+        // Free-space kernel spectrum from the exact CPU builder the CPU solve uses,
+        // transposed at upload: the pipeline applies it between the two FFT axis passes,
+        // i.e. while the grid sits in transposed layout (see substep()).
+        cpuGrid.buildIsolatedKernelTable(pmG, 8);
+        std::vector<float> greensT(padCells);
+        for (int32_t j = 0; j < padN; j++) {
+            for (int32_t i = 0; i < padN; i++) {
+                greensT[(size_t)i * padN + j] = cpuGrid.kernelHat[(size_t)j * padN + i];
             }
         }
-        greensBuf = makeSsbo(cells * 4, greensT.data());
+        greensBuf = makeSsbo(padCells * 4, greensT.data());
 
         // --- Neighbor grid (worst case sizing: smallest cell = rCut) ---
         binExtentW = worldW * 3.f;
@@ -207,8 +217,9 @@ struct GpuSim {
         snprintf(header, sizeof(header),
                  "#version 430\n"
                  "#define GRID_N %d\n"
-                 "#define LOG2_N %d\n"
-                 "#define HALF_N %d\n"
+                 "#define PAD_N %d\n"      // 2*GRID_N - zero-padded FFT dims for isolated boundaries
+                 "#define LOG2_PAD %d\n"
+                 "#define HALF_PAD %d\n"
                  "#define MAX_PER_CELL %d\n"
                  "#define TABLE_SIZE %d\n"
                  "#define PM_G %.9g\n"
@@ -219,7 +230,7 @@ struct GpuSim {
                  "#define GAP %.9g\n"
                  "#define FP_SCALE %.1f\n"
                  "#define TREE_SOFT_CAP2 %.9g\n",
-                 gridN, (int32_t)log2f((float)gridN), gridN / 2, MAX_PER_CELL, tableSize,
+                 gridN, gridN * 2, (int32_t)log2f((float)(gridN * 2)), gridN, MAX_PER_CELL, tableSize,
                  pmG, pairSoft, treeG, treeSoft, restitution, gap, DENSITY_FIXED_POINT_SCALE,
                  constants::GRAVITY_SOFTENING_MAX_LENGTH * constants::GRAVITY_SOFTENING_MAX_LENGTH);
         std::string h = header;
@@ -432,13 +443,16 @@ void main() {
         // units) x 2^24 = ~4.6e8, comfortably under 2^31; a single smallest deposit at 1M
         // particles is still ~hundreds of integer units, so quantization noise is far below
         // the CIC interpolation error itself.
+        // Indices wrap on the PADDED grid (see pm_gravity.h's depositCIC): a particle
+        // slightly outside the window deposits into pad cells at its true offset -
+        // correct under the min-image free-space kernel out to a full domain-width away.
         progDeposit = compileProgram(h + R"GLSL(
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Pos { vec2 pos[]; };
 layout(std430, binding = 1) buffer Props { vec4 props[]; };
 layout(std430, binding = 2) buffer DensityGrid { uint densityGrid[]; };
 uniform uint count; uniform vec2 cellSizes;
-int wrapIdx(int v) { return ((v % GRID_N) + GRID_N) % GRID_N; }
+int wrapIdx(int v) { return ((v % PAD_N) + PAD_N) % PAD_N; }
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
@@ -448,10 +462,10 @@ void main() {
     int x0 = wrapIdx(i0.x), y0 = wrapIdx(i0.y);
     int x1 = wrapIdx(i0.x + 1), y1 = wrapIdx(i0.y + 1);
     float m = props[i].z / (cellSizes.x * cellSizes.y);
-    atomicAdd(densityGrid[y0 * GRID_N + x0], uint((1.0 - f.x) * (1.0 - f.y) * m * FP_SCALE));
-    atomicAdd(densityGrid[y0 * GRID_N + x1], uint(f.x * (1.0 - f.y) * m * FP_SCALE));
-    atomicAdd(densityGrid[y1 * GRID_N + x0], uint((1.0 - f.x) * f.y * m * FP_SCALE));
-    atomicAdd(densityGrid[y1 * GRID_N + x1], uint(f.x * f.y * m * FP_SCALE));
+    atomicAdd(densityGrid[y0 * PAD_N + x0], uint((1.0 - f.x) * (1.0 - f.y) * m * FP_SCALE));
+    atomicAdd(densityGrid[y0 * PAD_N + x1], uint(f.x * (1.0 - f.y) * m * FP_SCALE));
+    atomicAdd(densityGrid[y1 * PAD_N + x0], uint((1.0 - f.x) * f.y * m * FP_SCALE));
+    atomicAdd(densityGrid[y1 * PAD_N + x1], uint(f.x * f.y * m * FP_SCALE));
 }
 )GLSL", "deposit");
 
@@ -461,45 +475,54 @@ layout(std430, binding = 0) buffer DensityGrid { uint densityGrid[]; };
 layout(std430, binding = 1) buffer Re { float re[]; };
 layout(std430, binding = 2) buffer Im { float im[]; };
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(GRID_N * GRID_N)) return;
+    // 2D dispatch flattened to a linear cell index: padded grids reach 4096^2/256 = 65536
+    // workgroups, past the GL-spec-minimum 65535 per-dimension dispatch limit (this ran on
+    // NVIDIA's much higher limit, but the WebGPU port failed validation on exactly this).
+    uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (i >= uint(PAD_N * PAD_N)) return;
     re[i] = float(densityGrid[i]) / FP_SCALE;
     im[i] = 0.0;
 }
 )GLSL", "dens2complex");
 
-        // One workgroup per row, whole row in shared memory, radix-2 butterflies with
-        // barriers between stages - the same math as fft.h's fft1d, laid out for a GPU.
-        // outScale folds the inverse transform's 1/N-per-axis normalization into the store.
+        // One workgroup per (padded) row, whole row in shared memory, radix-2 butterflies
+        // with barriers between stages - the same math as fft.h's fft1d, laid out for a
+        // GPU. A fixed 256-thread workgroup loops over the row's butterflies rather than
+        // one thread per butterfly: padded rows reach 4096 (2048 butterflies), past the
+        // guaranteed max workgroup size. Butterflies within a stage touch disjoint pairs,
+        // so intra-stage order is free; only the between-stage barrier matters. outScale
+        // folds the inverse transform's 1/N-per-axis normalization into the store.
         progFftRow = compileProgram(h + R"GLSL(
-layout(local_size_x = HALF_N) in;
+layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Re { float re[]; };
 layout(std430, binding = 1) buffer Im { float im[]; };
 uniform float dirSign;  // -1 forward, +1 inverse
-uniform float outScale; // 1.0 forward, 1.0/GRID_N inverse
-shared vec2 s[GRID_N];
+uniform float outScale; // 1.0 forward, 1.0/PAD_N inverse
+shared vec2 s[PAD_N];
 void main() {
     uint row = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
-    uint base = row * uint(GRID_N);
-    for (uint e = t; e < uint(GRID_N); e += uint(HALF_N)) {
-        uint r = bitfieldReverse(e) >> (32 - LOG2_N);
+    uint base = row * uint(PAD_N);
+    for (uint e = t; e < uint(PAD_N); e += 256u) {
+        uint r = bitfieldReverse(e) >> (32 - LOG2_PAD);
         s[r] = vec2(re[base + e], im[base + e]);
     }
     barrier();
-    for (uint len = 2u; len <= uint(GRID_N); len <<= 1) {
+    for (uint len = 2u; len <= uint(PAD_N); len <<= 1) {
         uint half_ = len >> 1;
-        uint blk = t / half_, k = t % half_;
-        uint i0 = blk * len + k, i1 = i0 + half_;
-        float ang = dirSign * 6.28318530718 * float(k) / float(len);
-        vec2 w = vec2(cos(ang), sin(ang));
-        vec2 a = s[i0], b = s[i1];
-        vec2 bw = vec2(b.x * w.x - b.y * w.y, b.x * w.y + b.y * w.x);
-        s[i0] = a + bw;
-        s[i1] = a - bw;
+        for (uint q = t; q < uint(HALF_PAD); q += 256u) {
+            uint blk = q / half_, k = q % half_;
+            uint i0 = blk * len + k, i1 = i0 + half_;
+            float ang = dirSign * 6.28318530718 * float(k) / float(len);
+            vec2 w = vec2(cos(ang), sin(ang));
+            vec2 a = s[i0], b = s[i1];
+            vec2 bw = vec2(b.x * w.x - b.y * w.y, b.x * w.y + b.y * w.x);
+            s[i0] = a + bw;
+            s[i1] = a - bw;
+        }
         barrier();
     }
-    for (uint e = t; e < uint(GRID_N); e += uint(HALF_N)) {
+    for (uint e = t; e < uint(PAD_N); e += 256u) {
         re[base + e] = s[e].x * outScale;
         im[base + e] = s[e].y * outScale;
     }
@@ -513,12 +536,12 @@ layout(std430, binding = 1) buffer Dst { float dst[]; };
 shared float tile[16][17]; // +1 pad kills shared-memory bank conflicts
 void main() {
     ivec2 g = ivec2(gl_WorkGroupID.xy) * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (g.x < GRID_N && g.y < GRID_N)
-        tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = src[g.y * GRID_N + g.x];
+    if (g.x < PAD_N && g.y < PAD_N)
+        tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = src[g.y * PAD_N + g.x];
     barrier();
     ivec2 gT = ivec2(gl_WorkGroupID.yx) * 16 + ivec2(gl_LocalInvocationID.xy);
-    if (gT.x < GRID_N && gT.y < GRID_N)
-        dst[gT.y * GRID_N + gT.x] = tile[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    if (gT.x < PAD_N && gT.y < PAD_N)
+        dst[gT.y * PAD_N + gT.x] = tile[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
 }
 )GLSL", "transpose");
 
@@ -528,8 +551,8 @@ layout(std430, binding = 0) buffer Re { float re[]; };
 layout(std430, binding = 1) buffer Im { float im[]; };
 layout(std430, binding = 2) buffer Greens { float greens[]; };
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(GRID_N * GRID_N)) return;
+    uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (i >= uint(PAD_N * PAD_N)) return;
     re[i] *= greens[i];
     im[i] *= greens[i];
 }
@@ -540,15 +563,15 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Phi { float phi[]; };
 layout(std430, binding = 1) buffer Force { vec2 force[]; };
 uniform vec2 cellSizes;
-int wrapIdx(int v) { return ((v % GRID_N) + GRID_N) % GRID_N; }
+int wrapIdx(int v) { return ((v % PAD_N) + PAD_N) % PAD_N; }
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= uint(GRID_N * GRID_N)) return;
-    int x = int(idx) % GRID_N, y = int(idx) / GRID_N;
-    float pxm = phi[y * GRID_N + wrapIdx(x - 1)];
-    float pxp = phi[y * GRID_N + wrapIdx(x + 1)];
-    float pym = phi[wrapIdx(y - 1) * GRID_N + x];
-    float pyp = phi[wrapIdx(y + 1) * GRID_N + x];
+    uint idx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (idx >= uint(PAD_N * PAD_N)) return;
+    int x = int(idx) % PAD_N, y = int(idx) / PAD_N;
+    float pxm = phi[y * PAD_N + wrapIdx(x - 1)];
+    float pxp = phi[y * PAD_N + wrapIdx(x + 1)];
+    float pym = phi[wrapIdx(y - 1) * PAD_N + x];
+    float pyp = phi[wrapIdx(y + 1) * PAD_N + x];
     force[idx] = vec2(-(pxp - pxm) / (2.0 * cellSizes.x), -(pyp - pym) / (2.0 * cellSizes.y));
 }
 )GLSL", "gradient");
@@ -559,7 +582,7 @@ layout(std430, binding = 0) buffer Pos { vec2 pos[]; };
 layout(std430, binding = 1) buffer Force { vec2 force[]; };
 layout(std430, binding = 2) buffer Acc { vec2 acc[]; };
 uniform uint count; uniform vec2 cellSizes;
-int wrapIdx(int v) { return ((v % GRID_N) + GRID_N) % GRID_N; }
+int wrapIdx(int v) { return ((v % PAD_N) + PAD_N) % PAD_N; }
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
@@ -568,10 +591,10 @@ void main() {
     vec2 f = g - vec2(i0);
     int x0 = wrapIdx(i0.x), y0 = wrapIdx(i0.y);
     int x1 = wrapIdx(i0.x + 1), y1 = wrapIdx(i0.y + 1);
-    acc[i] = (1.0 - f.x) * (1.0 - f.y) * force[y0 * GRID_N + x0]
-           + f.x * (1.0 - f.y) * force[y0 * GRID_N + x1]
-           + (1.0 - f.x) * f.y * force[y1 * GRID_N + x0]
-           + f.x * f.y * force[y1 * GRID_N + x1];
+    acc[i] = (1.0 - f.x) * (1.0 - f.y) * force[y0 * PAD_N + x0]
+           + f.x * (1.0 - f.y) * force[y0 * PAD_N + x1]
+           + (1.0 - f.x) * f.y * force[y1 * PAD_N + x0]
+           + f.x * f.y * force[y1 * PAD_N + x1];
 }
 )GLSL", "gather");
 
@@ -641,7 +664,13 @@ void main() {
         int32_t dimsY = std::min((int32_t)ceilf(binExtentH / cellSize) + 1, maxBinCellsY);
 
         int32_t pg = groups(count, 256);
-        int32_t cg = groups(gridN * gridN, 256);
+        int32_t padN = gridN * 2;
+        // Mesh cell passes run on the zero-padded grid, split over a 2D dispatch (see the
+        // flattened index in dens2complex/greens/gradient) - a 1D dispatch overflows the
+        // spec-minimum 65535 per-dimension workgroup limit at padded 4096.
+        int32_t cgTotal = groups(padN * padN, 256);
+        int32_t cgX = std::min(cgTotal, 32768);
+        int32_t cgY = groups(cgTotal, cgX);
 
         // 1. kick + drift
         glUseProgram(progIntegrate);
@@ -727,7 +756,7 @@ void main() {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, densityGridBuf);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gridReA);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, gridImA);
-        glDispatchCompute(cg, 1, 1);
+        glDispatchCompute(cgX, cgY, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         // 9-15. FFT Poisson solve: rowFFT -> transpose -> rowFFT -> greens (in transposed
@@ -739,18 +768,18 @@ void main() {
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, imB);
             glUniform1f(glGetUniformLocation(progFftRow, "dirSign"), sign);
             glUniform1f(glGetUniformLocation(progFftRow, "outScale"), scale);
-            glDispatchCompute(gridN, 1, 1);
+            glDispatchCompute(padN, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         };
         auto transposePass = [&](GLuint src, GLuint dst) {
             glUseProgram(progTranspose);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, src);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dst);
-            glDispatchCompute(groups(gridN, 16), groups(gridN, 16), 1);
+            glDispatchCompute(groups(padN, 16), groups(padN, 16), 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         };
 
-        float invN = 1.f / (float)gridN;
+        float invN = 1.f / (float)padN;
         fftPass(gridReA, gridImA, -1.f, 1.f);
         transposePass(gridReA, gridReB);
         transposePass(gridImA, gridImB);
@@ -760,7 +789,7 @@ void main() {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gridReB);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gridImB);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, greensBuf);
-        glDispatchCompute(cg, 1, 1);
+        glDispatchCompute(cgX, cgY, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         fftPass(gridReB, gridImB, 1.f, invN);
@@ -773,7 +802,7 @@ void main() {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gridReA);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, forceBuf);
         glUniform2f(glGetUniformLocation(progGradient, "cellSizes"), cellW, cellH);
-        glDispatchCompute(cg, 1, 1);
+        glDispatchCompute(cgX, cgY, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         // 17. CIC gather -> acc

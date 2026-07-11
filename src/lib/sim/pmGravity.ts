@@ -21,8 +21,19 @@
 // (PMShortRangeTable, applyP3MCorrection) fixes close pairs by replacing the mesh's wrong
 // contribution with a correctly-softened direct pairwise force.
 //
-// The mesh solve is inherently periodic (toroidal) - positions are never wrapped to match;
-// wrap() below only wraps grid *indices*, which is well-defined for any position.
+// BOUNDARY CONDITIONS: the mesh solve uses ISOLATED (free-space) boundaries via the
+// classic Hockney & Eastwood zero-padding trick - FFT grids are 2x the physical
+// resolution per axis, and the density is convolved with the true free-space 2D kernel
+// (a softened G*ln(r^2) potential, built in real space with min-image displacements and
+// FFT'd once) instead of a periodic Green's function. A plain FFT Poisson solve is
+// inherently periodic - it tiles the domain to infinity, so every particle is also pulled
+// by phantom image copies of the whole swarm one domain away. On a typical wide canvas
+// those images sit much closer vertically than horizontally, which measurably weakened
+// the inward pull on top/bottom particles vs side particles (2.7x at the spawn disc's
+// edge, verified in the native app with a ring-of-probes test) - visible at sim start as
+// the sides collapsing inward faster. The padding costs 4x the FFT area; deposit,
+// gradient, and gather run on the padded grid too, so particles up to a full domain-width
+// outside the window keep correct forces (only farther ones alias back around).
 import { fft2d } from './fft.ts';
 
 // Gaussian low-pass length for the mesh's own Green's function, in units of sqrt(cell
@@ -32,21 +43,27 @@ import { fft2d } from './fft.ts';
 export const PM_MESH_SOFTENING_CELLS = 1.5;
 
 export function createPMGrid(nx, ny, width, height) {
-    const total = nx * ny;
+    // fftNx/fftNy are the zero-padded FFT dims (2x per axis) for isolated boundaries -
+    // see this file's header. All work arrays live on the padded grid.
+    const fftNx = 2 * nx, fftNy = 2 * ny;
+    const fftTotal = fftNx * fftNy;
     return {
         nx, ny,
+        fftNx, fftNy,
         domainWidth: width,
         domainHeight: height,
         cellWidth: width / nx,
         cellHeight: height / ny,
-        density: new Float32Array(total),
-        potentialRe: new Float32Array(total),
-        potentialIm: new Float32Array(total),
-        forceX: new Float32Array(total),
-        forceY: new Float32Array(total),
-        // Precomputed per-cell Green's multiplier - fully static for a given grid/G.
-        greensScale: new Float32Array(total),
-        greensBuiltForG: 0,
+        density: new Float32Array(fftTotal),
+        potentialRe: new Float32Array(fftTotal),
+        potentialIm: new Float32Array(fftTotal),
+        forceX: new Float32Array(fftTotal),
+        forceY: new Float32Array(fftTotal),
+        // Free-space kernel spectrum - fully static for a given grid/G. Real-valued: the
+        // real-space kernel is even under min-image negation, so its DFT is real (the
+        // float-noise imaginary part is discarded at build time).
+        kernelHat: new Float32Array(fftTotal),
+        kernelBuiltForG: 0,
     };
 }
 
@@ -56,25 +73,32 @@ function wrap(i, n) {
 }
 
 /**
- * Green's function for d^2(phi) = 4*pi*G*rho in Fourier space: the Laplacian becomes -k^2
- * for a mode e^{ikx}, so phi_hat = -4*pi*G*rho_hat/k^2, with a Gaussian exp(-k^2*sigma^2)
- * low-pass on top (the classic PM softening). k=0 (the mean mode) gets scale 0 - an
- * overall constant offset to phi, physically meaningless and singular in the formula.
+ * Isolated (free-space) kernel: the 2D Poisson equation d^2(phi) = 4*pi*G*rho has the
+ * free-space point response phi(r) = 2*G*ln(r) (d^2(ln r) = 2*pi*delta in 2D),
+ * Plummer-softened here to G*ln(r^2 + eps^2) with eps = the PM_MESH_SOFTENING_CELLS mesh
+ * softening. Built in REAL space on the doubled grid with min-image displacements, then
+ * FFT'd once - multiplying the padded density's spectrum by this and inverting IS the
+ * discrete free-space convolution, valid for all source/target separations up to one
+ * full physical domain (half the doubled grid). cellArea is folded in because the
+ * density grid stores mass/cellArea while the convolution needs plain mass.
  */
-export function buildGreensTable(grid, G) {
-    const softeningLength = PM_MESH_SOFTENING_CELLS * Math.sqrt(grid.cellWidth * grid.cellHeight);
-    const softeningLengthSq = softeningLength * softeningLength;
-    for (let j = 0; j < grid.ny; j++) {
-        const ky = j <= grid.ny / 2 ? j : j - grid.ny;
-        const kyReal = 2 * Math.PI * ky / grid.domainHeight;
-        for (let i = 0; i < grid.nx; i++) {
-            const kx = i <= grid.nx / 2 ? i : i - grid.nx;
-            const kxReal = 2 * Math.PI * kx / grid.domainWidth;
-            const k2 = kxReal * kxReal + kyReal * kyReal;
-            grid.greensScale[j * grid.nx + i] = k2 === 0 ? 0 : (-4 * Math.PI * G / k2) * Math.exp(-k2 * softeningLengthSq);
+export function buildIsolatedKernelTable(grid, G) {
+    const eps = PM_MESH_SOFTENING_CELLS * Math.sqrt(grid.cellWidth * grid.cellHeight);
+    const epsSq = eps * eps;
+    const cellArea = grid.cellWidth * grid.cellHeight;
+    const kIm = new Float32Array(grid.fftNx * grid.fftNy);
+    for (let j = 0; j < grid.fftNy; j++) {
+        const dy = j <= grid.fftNy / 2 ? j : j - grid.fftNy;
+        const y = dy * grid.cellHeight;
+        for (let i = 0; i < grid.fftNx; i++) {
+            const dx = i <= grid.fftNx / 2 ? i : i - grid.fftNx;
+            const x = dx * grid.cellWidth;
+            grid.kernelHat[j * grid.fftNx + i] = G * Math.log(x * x + y * y + epsSq) * cellArea;
         }
     }
-    grid.greensBuiltForG = G;
+    fft2d(grid.kernelHat, kIm, grid.fftNx, grid.fftNy, false);
+    // kernelHat now holds the (real) spectrum; kIm is float noise and is discarded.
+    grid.kernelBuiltForG = G;
 }
 
 /**
@@ -86,8 +110,8 @@ export function buildGreensTable(grid, G) {
  */
 export function computeGravityPMMesh(system, grid, G, scratch) {
     const count = system.count;
-    if (grid.greensBuiltForG !== G) {
-        buildGreensTable(grid, G);
+    if (grid.kernelBuiltForG !== G) {
+        buildIsolatedKernelTable(grid, G);
     }
 
     for (let i = 0; i < count; i++) {
@@ -100,7 +124,10 @@ export function computeGravityPMMesh(system, grid, G, scratch) {
         scratch.weights = new Float32Array(count * 4);
     }
     const weights = scratch.weights;
-    const nx = grid.nx, ny = grid.ny;
+    // Deposit/gather indices wrap on the PADDED grid: a particle slightly outside the
+    // window lands in pad cells at its true offset (correct under the min-image
+    // free-space kernel out to a full domain-width away).
+    const fnx = grid.fftNx, fny = grid.fftNy;
     const cellArea = grid.cellWidth * grid.cellHeight;
 
     for (let i = 0; i < count; i++) {
@@ -115,49 +142,53 @@ export function computeGravityPMMesh(system, grid, G, scratch) {
         weights[i * 4 + 2] = fx;
         weights[i * 4 + 3] = fy;
 
-        const ix0 = wrap(ix, nx), iy0 = wrap(iy, ny);
-        const ix1 = wrap(ix + 1, nx), iy1 = wrap(iy + 1, ny);
+        const ix0 = wrap(ix, fnx), iy0 = wrap(iy, fny);
+        const ix1 = wrap(ix + 1, fnx), iy1 = wrap(iy + 1, fny);
         const m = system.mass[i] / cellArea;
-        grid.density[iy0 * nx + ix0] += (1 - fx) * (1 - fy) * m;
-        grid.density[iy0 * nx + ix1] += fx * (1 - fy) * m;
-        grid.density[iy1 * nx + ix0] += (1 - fx) * fy * m;
-        grid.density[iy1 * nx + ix1] += fx * fy * m;
+        grid.density[iy0 * fnx + ix0] += (1 - fx) * (1 - fy) * m;
+        grid.density[iy0 * fnx + ix1] += fx * (1 - fy) * m;
+        grid.density[iy1 * fnx + ix0] += (1 - fx) * fy * m;
+        grid.density[iy1 * fnx + ix1] += fx * fy * m;
     }
 
     grid.potentialIm.fill(0);
     grid.potentialRe.set(grid.density);
-    fft2d(grid.potentialRe, grid.potentialIm, nx, ny, false);
+    fft2d(grid.potentialRe, grid.potentialIm, fnx, fny, false);
 
-    const total = nx * ny;
+    // Isolated-boundary Poisson solve by convolution: multiply the padded density's
+    // spectrum by the free-space kernel spectrum and invert (see buildIsolatedKernelTable
+    // and this file's header).
+    const total = fnx * fny;
     for (let idx = 0; idx < total; idx++) {
-        grid.potentialRe[idx] *= grid.greensScale[idx];
-        grid.potentialIm[idx] *= grid.greensScale[idx];
+        grid.potentialRe[idx] *= grid.kernelHat[idx];
+        grid.potentialIm[idx] *= grid.kernelHat[idx];
     }
 
-    fft2d(grid.potentialRe, grid.potentialIm, nx, ny, true);
+    fft2d(grid.potentialRe, grid.potentialIm, fnx, fny, true);
 
-    // Force = -grad(phi), central differences with periodic wraparound.
-    for (let j = 0; j < ny; j++) {
-        const jm = wrap(j - 1, ny), jp = wrap(j + 1, ny);
-        for (let i = 0; i < nx; i++) {
-            const im_ = wrap(i - 1, nx), ip = wrap(i + 1, nx);
-            const idx = j * nx + i;
-            grid.forceX[idx] = -(grid.potentialRe[j * nx + ip] - grid.potentialRe[j * nx + im_]) / (2 * grid.cellWidth);
-            grid.forceY[idx] = -(grid.potentialRe[jp * nx + i] - grid.potentialRe[jm * nx + i]) / (2 * grid.cellHeight);
+    // Force = -grad(phi), central differences over the whole padded grid (wrapping on
+    // the padded dims is still correct at its edges: cell -1 is cell fftNx-1 by min-image).
+    for (let j = 0; j < fny; j++) {
+        const jm = wrap(j - 1, fny), jp = wrap(j + 1, fny);
+        for (let i = 0; i < fnx; i++) {
+            const im_ = wrap(i - 1, fnx), ip = wrap(i + 1, fnx);
+            const idx = j * fnx + i;
+            grid.forceX[idx] = -(grid.potentialRe[j * fnx + ip] - grid.potentialRe[j * fnx + im_]) / (2 * grid.cellWidth);
+            grid.forceY[idx] = -(grid.potentialRe[jp * fnx + i] - grid.potentialRe[jm * fnx + i]) / (2 * grid.cellHeight);
         }
     }
 
     for (let i = 0; i < count; i++) {
         const ix = weights[i * 4], iy = weights[i * 4 + 1];
         const fx = weights[i * 4 + 2], fy = weights[i * 4 + 3];
-        const ix0 = wrap(ix, nx), iy0 = wrap(iy, ny);
-        const ix1 = wrap(ix + 1, nx), iy1 = wrap(iy + 1, ny);
+        const ix0 = wrap(ix, fnx), iy0 = wrap(iy, fny);
+        const ix1 = wrap(ix + 1, fnx), iy1 = wrap(iy + 1, fny);
         const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
         const w01 = (1 - fx) * fy, w11 = fx * fy;
-        system.accX[i] += w00 * grid.forceX[iy0 * nx + ix0] + w10 * grid.forceX[iy0 * nx + ix1]
-                        + w01 * grid.forceX[iy1 * nx + ix0] + w11 * grid.forceX[iy1 * nx + ix1];
-        system.accY[i] += w00 * grid.forceY[iy0 * nx + ix0] + w10 * grid.forceY[iy0 * nx + ix1]
-                        + w01 * grid.forceY[iy1 * nx + ix0] + w11 * grid.forceY[iy1 * nx + ix1];
+        system.accX[i] += w00 * grid.forceX[iy0 * fnx + ix0] + w10 * grid.forceX[iy0 * fnx + ix1]
+                        + w01 * grid.forceX[iy1 * fnx + ix0] + w11 * grid.forceX[iy1 * fnx + ix1];
+        system.accY[i] += w00 * grid.forceY[iy0 * fnx + ix0] + w10 * grid.forceY[iy0 * fnx + ix1]
+                        + w01 * grid.forceY[iy1 * fnx + ix0] + w11 * grid.forceY[iy1 * fnx + ix1];
     }
 }
 
@@ -181,10 +212,12 @@ export function createPMScratch() {
  * FIXED-resolution calibration grid whose physical CELL SIZE matches production - the
  * short-range mesh response being tabulated is set by cell size, and calibrating on the
  * full production grid would make startup scale with grid area (the native app measured
- * minutes of FFTs at grid 2048). 128 (vs the native 256) keeps the JS calibration to a
- * few hundred ms; rCut is only ~4 cells, far inside a 128-cell periodic domain.
+ * minutes of FFTs at grid 2048). 64: the isolated-boundary solve pads its FFTs to 2x per
+ * axis (quadrupling per-entry cost) and is image-free at any domain size that simply
+ * contains rCut (~4 cells), so the roomier domain the periodic version needed is now
+ * pure waste - 64 keeps the JS calibration to a few hundred ms.
  */
-const CAL_GRID_N = 128;
+const CAL_GRID_N = 64;
 
 export function calibratePMShortRangeTable(cellW, cellH, G, rCut, tableSize) {
     const table = {

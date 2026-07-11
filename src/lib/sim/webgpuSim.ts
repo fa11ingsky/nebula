@@ -34,10 +34,15 @@
 //    in collapsed cores - without it the parallel sum of k simultaneous full-strength
 //    impulses pumps unbounded energy, measured directly in the native app).
 //  - The mesh solve matches pmGravity.ts end-to-end (same CIC weights, same radix-2 FFT
-//    math, same Green's table - built by pmGravity.ts's buildGreensTable and uploaded
-//    pre-transposed - same central-difference gradient), so the CPU-calibrated P3M table
-//    stays valid on GPU.
-import { createPMGrid, buildGreensTable } from './pmGravity.ts';
+//    math, same central-difference gradient), INCLUDING the isolated (free-space)
+//    boundary treatment: FFT grids are zero-padded to 2x per axis and multiplied by the
+//    same free-space kernel spectrum pmGravity.ts's buildIsolatedKernelTable computes
+//    (uploaded pre-transposed) - no periodic image forces (see pmGravity.ts's header for
+//    the anisotropic-collapse artifact those caused). The CPU-calibrated P3M table stays
+//    valid on GPU. Padded rows need PAD_N*8 bytes of workgroup memory in the FFT kernel -
+//    16KB (WebGPU's default limit) covers grids up to 1024; the worker requests a higher
+//    limit from the adapter so 2048 works where hardware allows (see autoGridSize).
+import { createPMGrid, buildIsolatedKernelTable } from './pmGravity.ts';
 
 function roundUpPow2(v) {
     let p = 1;
@@ -45,10 +50,15 @@ function roundUpPow2(v) {
     return p;
 }
 
-/** Grid resolution matched to particle count (same auto-scaling rule as the native app). */
-export function autoGridSize(particleCount) {
+/**
+ * Grid resolution matched to particle count (same auto-scaling rule as the native app),
+ * capped so the FFT kernel's shared row fits the device's workgroup-storage limit: the
+ * isolated-boundary solve runs padded rows of 2*gridN vec2f's, i.e. gridN*16 bytes.
+ */
+export function autoGridSize(particleCount, maxWorkgroupStorageBytes = 16384) {
     const n = roundUpPow2(Math.ceil(Math.sqrt(particleCount * 2)));
-    return Math.max(256, Math.min(n, 2048));
+    const deviceCap = roundUpPow2(Math.floor(maxWorkgroupStorageBytes / 16) + 1) >> 1; // largest pow2 with gridN*16 <= limit
+    return Math.max(256, Math.min(n, Math.min(2048, deviceCap)));
 }
 
 /**
@@ -70,7 +80,10 @@ export async function createWebGPUSim(device, system, opts) {
     const cellW = worldW / gridN;
     const cellH = worldH / gridN;
     const rCut = table.rCut;
-    const cells = gridN * gridN;
+    // Mesh buffers are sized for the ZERO-PADDED (2x per axis) isolated-boundary solve -
+    // see pmGravity.ts's header for why the padding is load-bearing.
+    const padN = gridN * 2;
+    const padCells = padN * padN;
 
     // --- Particle data, uploaded once from the CPU-side spawn ---
     const pos2 = new Float32Array(count * 2);
@@ -138,25 +151,25 @@ export async function createWebGPUSim(device, system, opts) {
     const contactBufB = mkBuf(count * 4, S | CD);
     const colorRadiusBuf = mkBuf(count * 16, S | CD, colorRadius);
 
-    const densityGridBuf = mkBuf(cells * 4, S | CD);
-    const gridReA = mkBuf(cells * 4, S);
-    const gridImA = mkBuf(cells * 4, S);
-    const gridReB = mkBuf(cells * 4, S);
-    const gridImB = mkBuf(cells * 4, S);
-    const forceBuf = mkBuf(cells * 8, S);
+    const densityGridBuf = mkBuf(padCells * 4, S | CD);
+    const gridReA = mkBuf(padCells * 4, S);
+    const gridImA = mkBuf(padCells * 4, S);
+    const gridReB = mkBuf(padCells * 4, S);
+    const gridImB = mkBuf(padCells * 4, S);
+    const forceBuf = mkBuf(padCells * 8, S);
 
-    // Green's table via the exact same CPU code the CPU PM path uses, transposed at
-    // upload: the pipeline applies it between the two FFT axis passes, i.e. while the
-    // grid sits in transposed layout.
+    // Free-space kernel spectrum via the exact same CPU code the CPU PM path uses,
+    // transposed at upload: the pipeline applies it between the two FFT axis passes,
+    // i.e. while the grid sits in transposed layout.
     const greensGrid = createPMGrid(gridN, gridN, worldW, worldH);
-    buildGreensTable(greensGrid, pmG);
-    const greensT = new Float32Array(cells);
-    for (let j = 0; j < gridN; j++) {
-        for (let i = 0; i < gridN; i++) {
-            greensT[i * gridN + j] = greensGrid.greensScale[j * gridN + i];
+    buildIsolatedKernelTable(greensGrid, pmG);
+    const greensT = new Float32Array(padCells);
+    for (let j = 0; j < padN; j++) {
+        for (let i = 0; i < padN; i++) {
+            greensT[i * padN + j] = greensGrid.kernelHat[j * padN + i];
         }
     }
-    const greensBuf = mkBuf(cells * 4, S | CD, greensT);
+    const greensBuf = mkBuf(padCells * 4, S | CD, greensT);
 
     const cellCountBuf = mkBuf(maxCells * 4, S | CD);
     const cellItemsBuf = mkBuf(maxCells * MAX_PER_CELL * 4, S | CD);
@@ -170,9 +183,10 @@ export async function createWebGPUSim(device, system, opts) {
     const consts = /* wgsl */ `
 const COUNT: u32 = ${count}u;
 const GRID_N: u32 = ${gridN}u;
-const GRID_NI: i32 = ${gridN};
-const LOG2_N: u32 = ${log2N}u;
-const HALF_N: u32 = ${gridN / 2}u;
+const PAD_N: u32 = ${padN}u;
+const PAD_NI: i32 = ${padN};
+const LOG2_PAD: u32 = ${log2N + 1}u;
+const HALF_PAD: u32 = ${gridN}u;
 const MAX_PER_CELL: u32 = ${MAX_PER_CELL}u;
 const TABLE_SIZE: i32 = ${table.tableSize};
 const PM_G: f32 = ${pmG};
@@ -377,7 +391,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 @group(0) @binding(0) var<storage, read> pos: array<vec2f>;
 @group(0) @binding(1) var<storage, read> props: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> densityGrid: array<atomic<u32>>;
-fn wrapIdx(v: i32) -> i32 { return ((v % GRID_NI) + GRID_NI) % GRID_NI; }
+fn wrapIdx(v: i32) -> i32 { return ((v % PAD_NI) + PAD_NI) % PAD_NI; }
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
@@ -388,10 +402,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let x0 = wrapIdx(i0.x); let y0 = wrapIdx(i0.y);
     let x1 = wrapIdx(i0.x + 1); let y1 = wrapIdx(i0.y + 1);
     let m = props[i].z / (CELL_W * CELL_H);
-    atomicAdd(&densityGrid[y0 * GRID_NI + x0], u32((1.0 - f.x) * (1.0 - f.y) * m * FP_SCALE));
-    atomicAdd(&densityGrid[y0 * GRID_NI + x1], u32(f.x * (1.0 - f.y) * m * FP_SCALE));
-    atomicAdd(&densityGrid[y1 * GRID_NI + x0], u32((1.0 - f.x) * f.y * m * FP_SCALE));
-    atomicAdd(&densityGrid[y1 * GRID_NI + x1], u32(f.x * f.y * m * FP_SCALE));
+    atomicAdd(&densityGrid[y0 * PAD_NI + x0], u32((1.0 - f.x) * (1.0 - f.y) * m * FP_SCALE));
+    atomicAdd(&densityGrid[y0 * PAD_NI + x1], u32(f.x * (1.0 - f.y) * m * FP_SCALE));
+    atomicAdd(&densityGrid[y1 * PAD_NI + x0], u32((1.0 - f.x) * f.y * m * FP_SCALE));
+    atomicAdd(&densityGrid[y1 * PAD_NI + x1], u32(f.x * f.y * m * FP_SCALE));
 }`;
 
     const dens2ComplexSrc = consts + /* wgsl */ `
@@ -399,9 +413,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 @group(0) @binding(1) var<storage, read_write> re: array<f32>;
 @group(0) @binding(2) var<storage, read_write> im: array<f32>;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let i = gid.x;
-    if (i >= GRID_N * GRID_N) { return; }
+fn main(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+    // 2D dispatch flattened to a linear cell index: padded grids reach 4096^2/256 = 65536
+    // workgroups, one past the 65535 per-dimension dispatch limit.
+    let i = (wid.y * nwg.x + wid.x) * 256u + lid.x;
+    if (i >= PAD_N * PAD_N) { return; }
     re[i] = f32(densityGrid[i]) / FP_SCALE;
     im[i] = 0.0;
 }`;
@@ -415,20 +431,20 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     const fftRowSrc = (dirSign, outScale) => consts + /* wgsl */ `
 @group(0) @binding(0) var<storage, read_write> re: array<f32>;
 @group(0) @binding(1) var<storage, read_write> im: array<f32>;
-var<workgroup> s: array<vec2f, ${gridN}>;
+var<workgroup> s: array<vec2f, ${padN}>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
     let row = wid.x;
     let t = lid.x;
-    let base = row * GRID_N;
-    for (var e = t; e < GRID_N; e += 256u) {
-        let r = reverseBits(e) >> (32u - LOG2_N);
+    let base = row * PAD_N;
+    for (var e = t; e < PAD_N; e += 256u) {
+        let r = reverseBits(e) >> (32u - LOG2_PAD);
         s[r] = vec2f(re[base + e], im[base + e]);
     }
     workgroupBarrier();
-    for (var len = 2u; len <= GRID_N; len = len << 1u) {
+    for (var len = 2u; len <= PAD_N; len = len << 1u) {
         let half_ = len >> 1u;
-        for (var q = t; q < HALF_N; q += 256u) {
+        for (var q = t; q < HALF_PAD; q += 256u) {
             let blk = q / half_;
             let k = q % half_;
             let i0 = blk * len + k;
@@ -443,7 +459,7 @@ fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: ve
         }
         workgroupBarrier();
     }
-    for (var e = t; e < GRID_N; e += 256u) {
+    for (var e = t; e < PAD_N; e += 256u) {
         re[base + e] = s[e].x * ${outScale};
         im[base + e] = s[e].y * ${outScale};
     }
@@ -456,13 +472,13 @@ var<workgroup> tile: array<array<f32, 17>, 16>; // +1 pad kills shared-memory ba
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
     let g = vec2i(wid.xy) * 16 + vec2i(lid.xy);
-    if (g.x < GRID_NI && g.y < GRID_NI) {
-        tile[lid.y][lid.x] = src[g.y * GRID_NI + g.x];
+    if (g.x < PAD_NI && g.y < PAD_NI) {
+        tile[lid.y][lid.x] = src[g.y * PAD_NI + g.x];
     }
     workgroupBarrier();
     let gT = vec2i(wid.yx) * 16 + vec2i(lid.xy);
-    if (gT.x < GRID_NI && gT.y < GRID_NI) {
-        dst[gT.y * GRID_NI + gT.x] = tile[lid.x][lid.y];
+    if (gT.x < PAD_NI && gT.y < PAD_NI) {
+        dst[gT.y * PAD_NI + gT.x] = tile[lid.x][lid.y];
     }
 }`;
 
@@ -471,9 +487,11 @@ fn main(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid: ve
 @group(0) @binding(1) var<storage, read_write> im: array<f32>;
 @group(0) @binding(2) var<storage, read> greens: array<f32>;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let i = gid.x;
-    if (i >= GRID_N * GRID_N) { return; }
+fn main(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+    // 2D dispatch flattened to a linear cell index: padded grids reach 4096^2/256 = 65536
+    // workgroups, one past the 65535 per-dimension dispatch limit.
+    let i = (wid.y * nwg.x + wid.x) * 256u + lid.x;
+    if (i >= PAD_N * PAD_N) { return; }
     re[i] *= greens[i];
     im[i] *= greens[i];
 }`;
@@ -481,17 +499,17 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     const gradientSrc = consts + /* wgsl */ `
 @group(0) @binding(0) var<storage, read> phi: array<f32>;
 @group(0) @binding(1) var<storage, read_write> force: array<vec2f>;
-fn wrapIdx(v: i32) -> i32 { return ((v % GRID_NI) + GRID_NI) % GRID_NI; }
+fn wrapIdx(v: i32) -> i32 { return ((v % PAD_NI) + PAD_NI) % PAD_NI; }
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-    let idx = gid.x;
-    if (idx >= GRID_N * GRID_N) { return; }
-    let x = i32(idx) % GRID_NI;
-    let y = i32(idx) / GRID_NI;
-    let pxm = phi[y * GRID_NI + wrapIdx(x - 1)];
-    let pxp = phi[y * GRID_NI + wrapIdx(x + 1)];
-    let pym = phi[wrapIdx(y - 1) * GRID_NI + x];
-    let pyp = phi[wrapIdx(y + 1) * GRID_NI + x];
+fn main(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+    let idx = (wid.y * nwg.x + wid.x) * 256u + lid.x;
+    if (idx >= PAD_N * PAD_N) { return; }
+    let x = i32(idx) % PAD_NI;
+    let y = i32(idx) / PAD_NI;
+    let pxm = phi[y * PAD_NI + wrapIdx(x - 1)];
+    let pxp = phi[y * PAD_NI + wrapIdx(x + 1)];
+    let pym = phi[wrapIdx(y - 1) * PAD_NI + x];
+    let pyp = phi[wrapIdx(y + 1) * PAD_NI + x];
     force[idx] = vec2f(-(pxp - pxm) / (2.0 * CELL_W), -(pyp - pym) / (2.0 * CELL_H));
 }`;
 
@@ -499,7 +517,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 @group(0) @binding(0) var<storage, read> pos: array<vec2f>;
 @group(0) @binding(1) var<storage, read> force: array<vec2f>;
 @group(0) @binding(2) var<storage, read_write> acc: array<vec2f>;
-fn wrapIdx(v: i32) -> i32 { return ((v % GRID_NI) + GRID_NI) % GRID_NI; }
+fn wrapIdx(v: i32) -> i32 { return ((v % PAD_NI) + PAD_NI) % PAD_NI; }
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let i = gid.x;
@@ -509,10 +527,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let f = g - vec2f(i0);
     let x0 = wrapIdx(i0.x); let y0 = wrapIdx(i0.y);
     let x1 = wrapIdx(i0.x + 1); let y1 = wrapIdx(i0.y + 1);
-    acc[i] = (1.0 - f.x) * (1.0 - f.y) * force[y0 * GRID_NI + x0]
-           + f.x * (1.0 - f.y) * force[y0 * GRID_NI + x1]
-           + (1.0 - f.x) * f.y * force[y1 * GRID_NI + x0]
-           + f.x * f.y * force[y1 * GRID_NI + x1];
+    acc[i] = (1.0 - f.x) * (1.0 - f.y) * force[y0 * PAD_NI + x0]
+           + f.x * (1.0 - f.y) * force[y0 * PAD_NI + x1]
+           + (1.0 - f.x) * f.y * force[y1 * PAD_NI + x0]
+           + f.x * f.y * force[y1 * PAD_NI + x1];
 }`;
 
     // Same correction formula + linear table interpolation as pmGravity.ts's
@@ -585,7 +603,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         makePipeline(depositSrc, 'deposit'),
         makePipeline(dens2ComplexSrc, 'dens2complex'),
         makePipeline(fftRowSrc('-1.0', '1.0'), 'fft_fwd'),
-        makePipeline(fftRowSrc('1.0', `${1 / gridN}`), 'fft_inv'),
+        makePipeline(fftRowSrc('1.0', `${1 / padN}`), 'fft_inv'),
         makePipeline(transposeSrc, 'transpose'),
         makePipeline(greensSrc, 'greens'),
         makePipeline(gradientSrc, 'gradient'),
@@ -623,8 +641,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     const bgP3m = bg(pipeP3m, [posBuf, propsBuf, accBuf, cellCountBuf, cellItemsBuf, p3mTableBuf, maxBitsBuf, frameUniform]);
 
     const pGroups = Math.ceil(count / 256);
-    const cGroups = Math.ceil(cells / 256);
-    const tGroups = Math.ceil(gridN / 16);
+    // Cell passes split over a 2D dispatch - see the shader-side index flattening.
+    const cGroupsTotal = Math.ceil(padCells / 256);
+    const cGroupsX = Math.min(cGroupsTotal, 32768);
+    const cGroupsY = Math.ceil(cGroupsTotal / cGroupsX);
+    const tGroups = Math.ceil(padN / 16);
 
     const sim = {
         device,
@@ -703,21 +724,21 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             // 7. CIC deposit from corrected positions
             dispatch(pipeDeposit, bgDeposit, pGroups);
             // 8. fixed-point density -> complex field
-            dispatch(pipeDens2Complex, bgDens2Complex, cGroups);
+            dispatch(pipeDens2Complex, bgDens2Complex, cGroupsX, cGroupsY);
             // 9-15. FFT Poisson solve: rowFFT -> transpose -> rowFFT -> greens (in
             // transposed layout, table pre-transposed at init) -> inverse rowFFT ->
             // transpose -> inverse rowFFT, 1/N-per-axis scaling folded into the inverses.
-            dispatch(pipeFftFwd, bgFftA_fwd, gridN);
+            dispatch(pipeFftFwd, bgFftA_fwd, padN);
             dispatch(pipeTranspose, bgTransReAB, tGroups, tGroups);
             dispatch(pipeTranspose, bgTransImAB, tGroups, tGroups);
-            dispatch(pipeFftFwd, bgFftB_fwd, gridN);
-            dispatch(pipeGreens, bgGreens, cGroups);
-            dispatch(pipeFftInv, bgFftB_inv, gridN);
+            dispatch(pipeFftFwd, bgFftB_fwd, padN);
+            dispatch(pipeGreens, bgGreens, cGroupsX, cGroupsY);
+            dispatch(pipeFftInv, bgFftB_inv, padN);
             dispatch(pipeTranspose, bgTransReBA, tGroups, tGroups);
             dispatch(pipeTranspose, bgTransImBA, tGroups, tGroups);
-            dispatch(pipeFftInv, bgFftA_inv, gridN);
+            dispatch(pipeFftInv, bgFftA_inv, padN);
             // 16. force field = -grad(phi)
-            dispatch(pipeGradient, bgGradient, cGroups);
+            dispatch(pipeGradient, bgGradient, cGroupsX, cGroupsY);
             // 17. CIC gather -> acc
             dispatch(pipeGather, bgGather, pGroups);
             // 18. P3M short-range correction onto acc (+ records max |acc|^2)

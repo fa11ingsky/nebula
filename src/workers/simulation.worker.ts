@@ -84,7 +84,17 @@ function getGpuDevice() {
             if (!navigator.gpu) return null;
             const adapter = await navigator.gpu.requestAdapter();
             if (!adapter) return null;
-            return adapter.requestDevice();
+            // The isolated-boundary FFT kernel keeps one PADDED row (2*gridN vec2f's) in
+            // workgroup memory - the default 16KB limit caps the mesh at grid 1024.
+            // Request up to 32KB where the adapter offers it so the 2048 grid (used from
+            // ~500k particles up) stays available; autoGridSize caps itself to whatever
+            // the device actually granted.
+            const wanted = Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768);
+            try {
+                return await adapter.requestDevice({ requiredLimits: { maxComputeWorkgroupStorageSize: wanted } });
+            } catch {
+                return adapter.requestDevice();
+            }
         })().catch(() => null);
     }
     return gpuDevicePromise;
@@ -134,7 +144,7 @@ async function initGpuSim() {
         const device = await getGpuDevice();
         if (!device) throw new Error('WebGPU unavailable');
         const G = pmEffectiveG();
-        const gridN = autoGridSize(spawnedState.count);
+        const gridN = autoGridSize(spawnedState.count, device.limits.maxComputeWorkgroupStorageSize);
         const sim = await createWebGPUSim(device, spawnedState, {
             gridN,
             worldW,

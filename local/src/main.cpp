@@ -8,10 +8,11 @@
 //   --pm         use Particle-Mesh gravity (see pm_gravity.h) instead of the Barnes-Hut
 //                tree - a different gravity *model* (2D Poisson solve, ~1/r force law),
 //                not just a faster path to the same physics; see pm_gravity.h's header
-//                comment. The underlying mesh solve is inherently periodic (an FFT-based
-//                Poisson solve always tiles the domain), but positions are never wrapped -
-//                a particle that exits the window keeps going instead of reappearing on
-//                the opposite edge.
+//                comment. The CPU mesh solve uses isolated (free-space) boundaries via
+//                zero-padded FFTs - no periodic image forces (see pm_gravity.h's header
+//                for the anisotropic-collapse artifact the old periodic solve caused).
+//                Positions are never wrapped - a particle that exits the window keeps
+//                going.
 //   --pm-grid N  PM grid resolution per axis, rounded up to a power of two (default 256).
 //   --gpu        run the ENTIRE physics pipeline (integration, PM gravity, P3M correction,
 //                collision) as OpenGL 4.3 compute shaders - see gpu_sim.h, including where
@@ -357,15 +358,12 @@ int main(int argc, char** argv) {
                 computeGravityPM(sys, pmGrid, p3mTree, pmShortRangeTable, constants::PM_GRAVITATIONAL_CONSTANT,
                                   constants::PM_PAIR_SOFTENING_FACTOR, pmWeightsScratch, nullptr, constants::GRAVITY_MAX_THREADS);
                 // No position wraparound: particles that drift past a window edge just keep
-                // going instead of reappearing on the opposite side. This doesn't break the
-                // mesh solve - depositCIC/interpolateForceCIC already wrap the grid *index*
-                // via PMGrid::wrap regardless of how far outside [0,domain) the raw position
-                // is (floor()+modulo is well-defined for any float), so gravity itself is
-                // unaffected. What changes is purely visual/stored-position bookkeeping: a
-                // particle far outside the window is still gravitationally coupled to
-                // everyone else through the periodic mesh (an inherent property of an
-                // FFT-based Poisson solve, not something toggled here), it just isn't
-                // snapped back into view to make that obvious.
+                // going instead of reappearing on the opposite side. The mesh solve handles
+                // them fine - depositCIC/interpolateForceCIC wrap grid indices onto the
+                // zero-padded (2x) FFT grid, so a particle up to a full domain-width outside
+                // the window still lands in pad cells at its true offset and stays correctly
+                // coupled under the isolated-boundary kernel (see pm_gravity.h's header);
+                // only particles beyond that alias back around.
             } else {
                 computeGravity(sys, gravityTree, constants::GRAVITATIONAL_CONSTANT, constants::GRAVITY_SOFTENING_FACTOR,
                                constants::BARNES_HUT_THETA, constants::QUADTREE_MAX_DEPTH, constants::QUADTREE_LEAF_CAPACITY,
