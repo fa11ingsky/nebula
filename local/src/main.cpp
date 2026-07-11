@@ -50,6 +50,47 @@ inline int32_t roundUpPow2(int32_t v) {
     return p;
 }
 
+// Kept as one long string (not scattered per-flag comments elsewhere) so --help output
+// and the flags actually parsed in main() can't silently drift apart - if a flag's
+// behavior changes, this text and the parsing loop right below it are the two places to
+// update together.
+inline void printUsage(const char* argv0) {
+    printf(
+        "Nebula native - N-body gravity/collision simulation (C++/OpenGL port)\n"
+        "\n"
+        "Usage: %s [particleCount] [options]\n"
+        "\n"
+        "  particleCount         Number of swarm particles to spawn (default 2500).\n"
+        "                        Capped at %d normally, 4,000,000 under --gpu.\n"
+        "\n"
+        "Options:\n"
+        "  --central-mass        Add one additional fixed particle at the exact window\n"
+        "                        center, holding a large share of total mass - the swarm\n"
+        "                        orbits/accretes around it instead of just each other.\n"
+        "  --pm                  Use Particle-Mesh gravity (FFT Poisson solve, isolated\n"
+        "                        boundaries) instead of the default Barnes-Hut tree - a\n"
+        "                        different force law (~1/r, true 2D), not just a faster\n"
+        "                        path to the same physics. See pm_gravity.h.\n"
+        "  --pm-grid N           PM mesh resolution per axis, rounded up to a power of\n"
+        "                        two (default 256, auto-scaled under --gpu unless this is\n"
+        "                        given explicitly). Higher = finer short-range accuracy,\n"
+        "                        quadratically more FFT cost.\n"
+        "  --gpu                 Run the entire physics pipeline (integration, PM\n"
+        "                        gravity, P3M correction, collision) as OpenGL 4.3\n"
+        "                        compute shaders instead of the CPU. Implies --pm.\n"
+        "  --density-colors      Color particles by local crowding (blue=isolated,\n"
+        "                        red=mid-density, yellow/white=packed cores) instead of\n"
+        "                        their own flat color.\n"
+        "  --throttle            Cap the frame rate to roughly 100fps instead of running\n"
+        "                        uncapped - useful for eyeballing behavior without\n"
+        "                        pegging a CPU/GPU core at full tilt.\n"
+        "  -h, --help            Show this message and exit.\n"
+        "\n"
+        "Controls: scroll to zoom (toward cursor), click-drag to pan, on-screen buttons\n"
+        "to stop/resume, restart, and open settings.\n",
+        argv0, constants::MAX_PARTICLES);
+}
+
 constexpr float MIN_ZOOM = 0.1f;
 constexpr float MAX_ZOOM = 20.f;
 
@@ -125,6 +166,13 @@ int main(int argc, char** argv) {
     bool densityColors = false;
     int32_t pmGridSize = 256;
     bool pmGridExplicit = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printUsage(argv[0]);
+            return 0;
+        }
+    }
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--central-mass") == 0) {

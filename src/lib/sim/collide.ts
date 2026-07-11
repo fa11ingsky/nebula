@@ -292,6 +292,16 @@ export function collideParticles(system) {
             findNearbyInGrid(grid, system, i, searchRadius, candidates);
         }
 
+        // Local-crowding signal for the density color mode (see colors.ts's densityRamp) -
+        // free to compute here since candidates.length is already exactly what this
+        // broad-phase search just spent its cost finding, not an extra pass. sqrt (not a
+        // plain linear ratio) so the ramp's early stops (blue->red->yellow) get most of
+        // the visible range and only truly extreme crowding reaches the final stop -
+        // without it, every particle past DENSITY_BLUR_THRESHOLD neighbors clamps to
+        // exactly 1 and reads as one flat block of the ramp's last color, which in a
+        // realistically dense cluster can be most of the visible swarm at once.
+        system.density[i] = Math.sqrt(Math.min(candidates.length / constants.DENSITY_BLUR_THRESHOLD, 1));
+
         for (const j of candidates) {
             const pairKey = i < j ? i * system.capacity + j : j * system.capacity + i;
             if (resolvedPairs.has(pairKey)) {

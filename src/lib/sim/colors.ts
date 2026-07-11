@@ -63,3 +63,20 @@ export function getColorForMass(mass) {
 export function getDisplayColorForMass(mass, mergingEnabled) {
     return mergingEnabled ? getColorForMass(mass) : constants.COLORS.WHITE;
 }
+
+/**
+ * Heat-style ramp over a 0..1 local-density value (particleSystem.ts's `density` field,
+ * populated from collide.ts's candidate count on the CPU paths or webgpuSim.ts's contact
+ * count on the GPU path - see constants.ts's DENSITY_BLUR_THRESHOLD): isolated particles
+ * read cool blue by default, mid-density regions red, and packed cores climb through
+ * yellow into white - so color temperature tracks local crowding instead of a particle's
+ * own mass. Stops (and how many of them there are) live in constants.ts's
+ * DENSITY_COLOR_STOPS, evenly spaced across 0..1 by the same interpolateColorStops helper
+ * the mass gradient above uses - edit that array to retune the palette. The GPU-solver
+ * render path (webgpuRenderer.ts's attachSimBuffers) generates its own WGSL copy of this
+ * same ramp from those same stops - see that file for why it can only pick up a change on
+ * the GPU sim's next (re)build rather than live.
+ */
+export function densityRamp(t) {
+    return interpolateColorStops(constants.DENSITY_COLOR_STOPS, t);
+}

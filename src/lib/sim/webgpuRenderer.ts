@@ -11,6 +11,8 @@
 // same <canvas>. Switching backends at runtime therefore means swapping in a brand new
 // canvas element (see Particles.vue) rather than reconfiguring this one - this module
 // only ever deals with a canvas that's already been dedicated to WebGPU.
+import { densityRamp } from './colors.ts';
+import constants from '../constants.ts';
 
 const PARTICLE_FLOATS_PER_INSTANCE = 7; // posX, posY, radius, r, g, b, a
 const EXPLOSION_FLOATS_PER_INSTANCE = 7; // posX, posY, radius, r, g, b, a
@@ -69,6 +71,7 @@ function circleShader(fadeAtEdge) {
 struct Camera {
     offset: vec2<f32>,
     canvasSize: vec2<f32>,
+    zoom: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -92,7 +95,12 @@ fn vs_main(
         vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vertexIndex];
-    let worldPos = instancePos + camera.offset + corner * instanceRadius;
+    // camera.offset already resolves to (screenCenter - anchor*zoom + pan) on the CPU side
+    // (see simulation.worker.ts's cpuTick/gpuTick) - scaling instancePos and the corner's
+    // own radius offset by zoom here, then adding that offset unscaled, is what makes
+    // distances from the camera anchor (not the world origin) grow/shrink with zoom while
+    // still landing the anchor itself exactly on screen center + pan regardless of zoom.
+    let worldPos = (instancePos + corner * instanceRadius) * camera.zoom + camera.offset;
     let ndcX = (worldPos.x / camera.canvasSize.x) * 2.0 - 1.0;
     let ndcY = 1.0 - (worldPos.y / camera.canvasSize.y) * 2.0;
 
@@ -118,8 +126,16 @@ const CROSSHAIR_SHADER = /* wgsl */ `
 struct Camera {
     offset: vec2<f32>,
     canvasSize: vec2<f32>,
+    zoom: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
+// Already the fully-resolved SCREEN position (screenCenter + cameraPan - see
+// simulation.worker.ts) the camera anchor (COM or fixed world center) maps to, which is
+// exactly where this marker always belongs regardless of zoom - the anchor's own
+// distance from itself is zero, so it's invariant to the camera.offset/zoom math the
+// particle shaders use. This deliberately does NOT add camera.offset or scale by
+// camera.zoom - the crosshair's 8px arm length stays a constant on-screen size instead of
+// growing/shrinking with zoom, matching the Canvas2D path's compensated armHalf.
 @group(0) @binding(1) var<uniform> center: vec2<f32>;
 
 @vertex
@@ -128,7 +144,7 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f
         vec2<f32>(-8.0, 0.0), vec2<f32>(8.0, 0.0),
         vec2<f32>(0.0, -8.0), vec2<f32>(0.0, 8.0),
     );
-    let worldPos = center + camera.offset + offsets[vertexIndex];
+    let worldPos = center + offsets[vertexIndex];
     let ndcX = (worldPos.x / camera.canvasSize.x) * 2.0 - 1.0;
     let ndcY = 1.0 - (worldPos.y / camera.canvasSize.y) * 2.0;
     return vec4<f32>(ndcX, ndcY, 0.0, 1.0);
@@ -208,7 +224,10 @@ export async function createWebGPURenderer(canvas, existingDevice = null) {
     context.configure({ device, format, alphaMode: 'opaque' });
 
     const cameraBuffer = device.createBuffer({
-        size: 16, // vec2 offset + vec2 canvasSize, all f32 - 4*4 bytes
+        // vec2 offset + vec2 canvasSize + f32 zoom = 20 bytes, rounded up to WGSL's
+        // 8-byte struct alignment (16 + 4 -> 24) and then to 32 for a comfortable margin
+        // - some implementations validate uniform buffer bindings against extra padding.
+        size: 32,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -352,7 +371,7 @@ export function setWebGPUBackground(renderer, bitmap) {
     });
 }
 
-function fillParticleData(renderer, system) {
+function fillParticleData(renderer, system, densityColors) {
     const neededFloats = Math.max(system.count, 1) * PARTICLE_FLOATS_PER_INSTANCE;
     if (renderer.particleData.length < neededFloats) {
         renderer.particleData = new Float32Array(neededFloats);
@@ -363,9 +382,16 @@ function fillParticleData(renderer, system) {
         data[base] = system.posX[i];
         data[base + 1] = system.posY[i];
         data[base + 2] = system.radius[i];
-        data[base + 3] = system.colorR[i] / 255;
-        data[base + 4] = system.colorG[i] / 255;
-        data[base + 5] = system.colorB[i] / 255;
+        if (densityColors) {
+            const [dr, dg, db] = densityRamp(system.density[i]);
+            data[base + 3] = dr / 255;
+            data[base + 4] = dg / 255;
+            data[base + 5] = db / 255;
+        } else {
+            data[base + 3] = system.colorR[i] / 255;
+            data[base + 4] = system.colorG[i] / 255;
+            data[base + 5] = system.colorB[i] / 255;
+        }
         data[base + 6] = 1;
     }
     renderer.particleBuffer = growInstanceBuffer(
@@ -415,15 +441,16 @@ function fillExplosionData(renderer, explosions) {
  * WebGPU-backend equivalent of simulation.ts's displayAll + the worker's own
  * explosion/crosshair drawing. Textures aren't implemented on this path (see this file's
  * header comment) - particles always render as flat-colored circles here regardless of
- * the texturesEnabled setting.
+ * the texturesEnabled setting. `densityColors` swaps each particle's own color for
+ * colors.ts's densityRamp over its current local crowding (system.density[i]).
  */
-export function renderWebGPUFrame(renderer, system, explosions, camera, crosshairVisible) {
+export function renderWebGPUFrame(renderer, system, explosions, camera, crosshairVisible, densityColors = false) {
     const device = renderer.device;
 
-    const cameraData = new Float32Array([camera.offsetX, camera.offsetY, renderer.canvas.width, renderer.canvas.height]);
+    const cameraData = new Float32Array([camera.offsetX, camera.offsetY, renderer.canvas.width, renderer.canvas.height, camera.zoom]);
     device.queue.writeBuffer(renderer.cameraBuffer, 0, cameraData.buffer);
 
-    fillParticleData(renderer, system);
+    fillParticleData(renderer, system, densityColors);
     if (explosions.length > 0) {
         fillExplosionData(renderer, explosions);
     }
@@ -460,7 +487,7 @@ export function renderWebGPUFrame(renderer, system, explosions, camera, crosshai
     }
 
     if (crosshairVisible) {
-        const centerData = new Float32Array([camera.comX, camera.comY]);
+        const centerData = new Float32Array([camera.crosshairX, camera.crosshairY]);
         device.queue.writeBuffer(renderer.crosshairCenterBuffer, 0, centerData.buffer);
         pass.setPipeline(renderer.crosshairPipeline);
         pass.setBindGroup(0, renderer.crosshairBindGroup);
@@ -485,23 +512,62 @@ export function renderWebGPUFrame(renderer, system, explosions, camera, crosshai
  * choice the native renderer makes via its metaball field accumulation, reduced to its
  * cheapest form).
  */
+/**
+ * Generates a WGSL densityRamp(t) function from constants.ts's DENSITY_COLOR_STOPS,
+ * matching colors.ts's interpolateColorStops exactly (evenly-spaced segments across
+ * 0..1, clamped, linear-interpolated within whichever segment t falls into) - the GPU
+ * render pipeline can't call back into JS per-pixel, so this compiles the current stops
+ * straight into the shader source instead. Regenerated fresh every time the GPU sim
+ * (re)builds (attachSimBuffers runs once per creation), so editing DENSITY_COLOR_STOPS
+ * takes effect on the next Restart/solver switch, not live mid-run.
+ */
+function buildDensityRampWGSL(stops) {
+    const segmentCount = stops.length - 1;
+    const stopVecs = stops
+        .map(([r, g, b]) => `vec3<f32>(${r / 255}, ${g / 255}, ${b / 255})`)
+        .join(', ');
+    return /* wgsl */ `
+fn densityRamp(t: f32) -> vec3<f32> {
+    var stops = array<vec3<f32>, ${stops.length}>(${stopVecs});
+    let clampedT = clamp(t, 0.0, 1.0);
+    let scaled = clampedT * ${segmentCount}.0;
+    let idx = min(i32(floor(scaled)), ${segmentCount - 1});
+    let localT = scaled - f32(idx);
+    return mix(stops[idx], stops[idx + 1], localT);
+}
+`;
+}
+
 export function attachSimBuffers(renderer, sim) {
     const device = renderer.device;
     const alpha = sim.count > 100000 ? 0.3 : 1.0;
+    const densityRampWGSL = buildDensityRampWGSL(constants.DENSITY_COLOR_STOPS);
     const shader = /* wgsl */ `
 struct Camera {
     offset: vec2<f32>,
     canvasSize: vec2<f32>,
+    zoom: f32,
+};
+struct DensityMode {
+    // Only .x is meaningful - std140-style uniform layout pads to 16 bytes regardless.
+    mode: i32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<storage, read> particlePos: array<vec2<f32>>;
 @group(0) @binding(2) var<storage, read> colorRadius: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> density: array<f32>;
+@group(0) @binding(4) var<uniform> densityMode: DensityMode;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) localPos: vec2<f32>,
     @location(1) color: vec4<f32>,
 };
+
+// Generated from constants.ts's DENSITY_COLOR_STOPS by buildDensityRampWGSL() above -
+// see that function's comment for why this can't just call colors.ts's JS densityRamp
+// directly.
+${densityRampWGSL}
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) inst: u32) -> VertexOutput {
@@ -514,13 +580,16 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32, @builtin(instance_index) ins
     let corner = corners[vertexIndex];
     let cr = colorRadius[inst];
     let radius = max(cr.w, 0.5);
-    let worldPos = particlePos[inst] + camera.offset + corner * radius;
+    // Same zoom-around-anchor convention as circleShader() above - see that shader's
+    // comment for the full derivation.
+    let worldPos = (particlePos[inst] + corner * radius) * camera.zoom + camera.offset;
     let ndcX = (worldPos.x / camera.canvasSize.x) * 2.0 - 1.0;
     let ndcY = 1.0 - (worldPos.y / camera.canvasSize.y) * 2.0;
     var out: VertexOutput;
     out.position = vec4<f32>(ndcX, ndcY, 0.0, 1.0);
     out.localPos = corner;
-    out.color = vec4<f32>(cr.rgb, ${alpha});
+    let baseColor = select(cr.rgb, densityRamp(density[inst]), densityMode.mode != 0);
+    out.color = vec4<f32>(baseColor, ${alpha});
     return out;
 }
 
@@ -549,12 +618,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         },
         primitive: { topology: 'triangle-strip' },
     });
+    if (!renderer.simDensityModeBuffer) {
+        renderer.simDensityModeBuffer = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+    }
     renderer.simBindGroup = device.createBindGroup({
         layout: renderer.simPipeline.getBindGroupLayout(0),
         entries: [
             { binding: 0, resource: { buffer: renderer.cameraBuffer } },
             { binding: 1, resource: { buffer: sim.posBuf } },
             { binding: 2, resource: { buffer: sim.colorRadiusBuf } },
+            { binding: 3, resource: { buffer: sim.densityOutBuf } },
+            { binding: 4, resource: { buffer: renderer.simDensityModeBuffer } },
         ],
     });
     renderer.simCount = sim.count;
@@ -563,14 +640,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /**
  * Draws one GPU-physics frame straight from the sim's buffers - the counterpart to
  * renderWebGPUFrame for when the particle state lives on the GPU (no explosions: the
- * GPU pipeline is bounce-only, merges never happen there).
+ * GPU pipeline is bounce-only, merges never happen there). `densityColors` colors every
+ * particle by its live GPU-computed contact-derived density (webgpuSim.ts's
+ * densityOutBuf) via the shader's densityRamp instead of its own color.
  */
-export function renderWebGPUSimFrame(renderer, camera, crosshairVisible) {
+export function renderWebGPUSimFrame(renderer, camera, crosshairVisible, densityColors = false) {
     if (!renderer.simPipeline) return;
     const device = renderer.device;
 
-    const cameraData = new Float32Array([camera.offsetX, camera.offsetY, renderer.canvas.width, renderer.canvas.height]);
+    const cameraData = new Float32Array([camera.offsetX, camera.offsetY, renderer.canvas.width, renderer.canvas.height, camera.zoom]);
     device.queue.writeBuffer(renderer.cameraBuffer, 0, cameraData.buffer);
+    device.queue.writeBuffer(renderer.simDensityModeBuffer, 0, new Int32Array([densityColors ? 1 : 0]));
 
     const encoder = device.createCommandEncoder();
     const view = renderer.context.getCurrentTexture().createView();
@@ -594,7 +674,7 @@ export function renderWebGPUSimFrame(renderer, camera, crosshairVisible) {
     pass.draw(4, renderer.simCount);
 
     if (crosshairVisible) {
-        const centerData = new Float32Array([camera.comX, camera.comY]);
+        const centerData = new Float32Array([camera.crosshairX, camera.crosshairY]);
         device.queue.writeBuffer(renderer.crosshairCenterBuffer, 0, centerData.buffer);
         pass.setPipeline(renderer.crosshairPipeline);
         pass.setBindGroup(0, renderer.crosshairBindGroup);
@@ -610,6 +690,7 @@ export function destroyWebGPURenderer(renderer) {
     if (renderer.backgroundTexture) renderer.backgroundTexture.destroy();
     if (renderer.particleBuffer) renderer.particleBuffer.destroy();
     if (renderer.explosionBuffer) renderer.explosionBuffer.destroy();
+    if (renderer.simDensityModeBuffer) renderer.simDensityModeBuffer.destroy();
     renderer.cameraBuffer.destroy();
     renderer.crosshairCenterBuffer.destroy();
     // A shared device belongs to the GPU-physics sim's lifecycle, not this renderer's -

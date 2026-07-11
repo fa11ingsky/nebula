@@ -42,6 +42,12 @@ export function createParticleSystem(capacity) {
         colorG: new Uint8Array(capacity),
         colorB: new Uint8Array(capacity),
         colorString: new Array(capacity).fill(''),
+        // 0..1 local-crowding signal for the density color mode (see colors.ts's
+        // densityRamp) - populated per frame by collide.ts's broad-phase search
+        // (candidate count / constants.DENSITY_BLUR_THRESHOLD, clamped to 1). Stays at 0
+        // (coolest ramp color) whenever collideParticles doesn't run this frame - merging
+        // mode uses its own broad-phase search instead and never touches this field.
+        density: new Float32Array(capacity),
         removed: new Uint8Array(capacity),
         // Clamped tree-insertion coordinates - see quadtree.ts's buildQuadtree.
         treeX: new Float32Array(capacity),
@@ -88,6 +94,7 @@ export function addParticle(system, x, y, mass, mergingEnabled = true, fixed = f
         system.colorString[i] = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
         system.surface[i] = generateSurfaceFeatures(mass);
     }
+    system.density[i] = 0;
     system.fixed[i] = fixed ? 1 : 0;
     system.count++;
 }
@@ -169,5 +176,6 @@ export function copyParticle(system, from, to) {
     system.colorB[to] = system.colorB[from];
     system.colorString[to] = system.colorString[from];
     system.surface[to] = system.surface[from];
+    system.density[to] = system.density[from];
     system.fixed[to] = system.fixed[from];
 }

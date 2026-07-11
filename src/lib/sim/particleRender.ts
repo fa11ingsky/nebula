@@ -35,8 +35,22 @@ export function drawRingHalf(s, x, y, radius, ring, half) {
  * Renders one body at (x,y) with the given mass/radius/color/surface-texture data.
  * Parameterized by raw values rather than a particle system reference so it stays
  * decoupled from how particle data happens to be stored.
+ *
+ * `densityColor`, if given ([r,g,b]), forces the flat-circle fast path with that color
+ * regardless of texturesEnabled - the density color mode (colors.ts's densityRamp) shows
+ * local crowding, which the textured spherical-shading/craters/clouds path has no
+ * meaningful way to layer on top of, so it takes over the whole body's appearance instead.
  */
-export function displayBody(s, x, y, mass, radius, r, g, b, colorString, surface, texturesEnabled) {
+export function displayBody(s, x, y, mass, radius, r, g, b, colorString, surface, texturesEnabled, densityColor = null) {
+    if (densityColor) {
+        const ctx = s.drawingContext;
+        ctx.fillStyle = `rgb(${densityColor[0]}, ${densityColor[1]}, ${densityColor[2]})`;
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+    }
+
     if (!texturesEnabled) {
         // Cheap fallback: one flat-colored circle, no extra draw calls per particle - for
         // when the shading/craters/clouds/flares/glow below are costing more than they're

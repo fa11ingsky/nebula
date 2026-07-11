@@ -76,7 +76,7 @@ namespace constants {
     // + central-mass configuration (v0 ~1.6 vs v_esc ~1.3 even with zero softening), so 2
     // orbiting particles drifted away no matter how gravity was softened - both this and
     // the softening had to be fixed together (verified: either one alone still escapes).
-    constexpr float TOTAL_ANGULAR_MOMENTUM = 950.f;
+    constexpr float TOTAL_ANGULAR_MOMENTUM = 95000.f;
     constexpr float BARNES_HUT_THETA = 0.2f;
     constexpr int32_t QUADTREE_MAX_DEPTH = 16;
     constexpr int32_t QUADTREE_LEAF_CAPACITY = 16;

@@ -7,6 +7,7 @@ import { collideParticles } from './collide.ts';
 import { computeGravity } from './gravity.ts';
 import { computeGravityPM } from './pmGravity.ts';
 import { displayBody } from './particleRender.ts';
+import { densityRamp } from './colors.ts';
 
 export { spawnParticles } from './spawn.ts';
 export { computeCenterOfMass, recolorAll } from './particleSystem.ts';
@@ -76,7 +77,13 @@ export function stepSimulation(system, explosions, mergingEnabled, pm = null) {
     return { state: system, gravityTree };
 }
 
-export function displayAll(s, system, texturesEnabled) {
+/**
+ * `densityColors` colors every body by colors.ts's densityRamp over its current local
+ * crowding (system.density[i], populated by collide.ts each frame) instead of its own
+ * mass-gradient/fixed color - see particleRender.ts's displayBody for why this overrides
+ * texturesEnabled rather than combining with it.
+ */
+export function displayAll(s, system, texturesEnabled, densityColors = false) {
     for (let i = 0; i < system.count; i++) {
         displayBody(
             s,
@@ -85,7 +92,8 @@ export function displayAll(s, system, texturesEnabled) {
             system.colorR[i], system.colorG[i], system.colorB[i],
             system.colorString[i],
             system.surface[i],
-            texturesEnabled
+            texturesEnabled,
+            densityColors ? densityRamp(system.density[i]) : null
         );
     }
 }

@@ -35,6 +35,10 @@
                 <input type="checkbox" :checked="useWebGpu" @change="toggleRenderer()" :disabled="gravitySolver === 'gpu'" />
                 Use WebGPU Rendering{{ gravitySolver === 'gpu' ? ' (required by GPU solver)' : '' }}
             </label>
+            <label class="settings-row" :class="{ disabled: mergingEnabled && gravitySolver !== 'gpu' }">
+                <input type="checkbox" v-model="densityColors" :disabled="mergingEnabled && gravitySolver !== 'gpu'" />
+                Color by Density{{ mergingEnabled && gravitySolver !== 'gpu' ? ' (non-merging only)' : '' }}
+            </label>
             <label class="settings-row">
                 <input type="checkbox" v-model="crosshairVisible" />
                 Show Crosshair
@@ -135,6 +139,13 @@
                 // be switched off to fall back to plain flat circles when it's costing too
                 // much at high particle counts. Off by default for that reason.
                 texturesEnabled: false,
+                // Color every particle by local crowding (colors.ts's densityRamp) instead
+                // of its own color - see collide.ts's per-frame candidate count (CPU paths)
+                // or webgpuSim.ts's contact-derived density (GPU solver). Overrides
+                // texturesEnabled while active (see particleRender.ts's displayBody). On by
+                // default - it's the more legible view at the higher particle counts the
+                // default GPU solver (see mounted()) makes practical.
+                densityColors: true,
                 crosshairVisible: false,
                 // Collision flashes are purely cosmetic (never fed back into the physics),
                 // but at high particle counts merges happen often enough that the constant
@@ -189,9 +200,15 @@
             // bgSketch at all, on every call, not just the first.
             this.bgSketchReady = null;
             this.resizeTimer = null;
+            // Click-and-drag panning state (see handleMouseDown/handleMouseMove/
+            // handleMouseUp) - plain instance fields rather than reactive data, since
+            // nothing in the template needs to react to a drag in progress.
+            this.isDragging = false;
+            this.lastMouseX = 0;
+            this.lastMouseY = 0;
         },
 
-        mounted() {
+        async mounted() {
             this.bgSketchReady = new Promise((resolve) => {
                 this.bgSketch = new p5((sketch) => {
                     sketch.setup = () => {
@@ -202,16 +219,38 @@
                 });
             });
 
-            this.startSimulation();
             window.addEventListener('resize', this.handleResize);
+            // Attached to the window (not the canvas) so a drag continues tracking even
+            // once the cursor slips past the canvas's edges mid-gesture - mousedown alone
+            // is canvas-scoped (see startSimulation/switchRenderer), but move/up need to
+            // keep firing regardless of where the cursor ends up.
+            window.addEventListener('mousemove', this.handleMouseMove);
+            window.addEventListener('mouseup', this.handleMouseUp);
 
-            isWebGPUSupported().then((supported) => {
-                this.webgpuSupported = supported;
-            });
+            // Checked and awaited BEFORE starting the sim, so the decision below is ready
+            // the instant there's a worker to send it to. startSimulation() always spawns
+            // in the (Barnes-Hut tree, Canvas2D) baseline first - a <canvas> only gets its
+            // real backend once switchRenderer/setGravitySolver hands the worker its first
+            // (and only) getContext() call, so there's no way to skip straight to a WebGPU-
+            // context canvas here without duplicating that async device/pipeline setup
+            // inline. Sequencing it this way (rather than firing both checks in parallel)
+            // avoids a real race: setGravitySolver('gpu') below manipulates this.$refs.canvas
+            // and this.worker, both of which startSimulation() is also busy setting up.
+            this.webgpuSupported = await isWebGPUSupported();
+            await this.startSimulation();
+            if (this.webgpuSupported) {
+                // Default to the full GPU pipeline (physics + rendering) when the browser
+                // actually supports it - this is the only solver that stays smooth at the
+                // higher particle counts, so it's the better default whenever it's available
+                // rather than something the user has to discover in Settings.
+                this.setGravitySolver('gpu');
+            }
         },
 
         beforeUnmount() {
             window.removeEventListener('resize', this.handleResize);
+            window.removeEventListener('mousemove', this.handleMouseMove);
+            window.removeEventListener('mouseup', this.handleMouseUp);
             clearTimeout(this.resizeTimer);
             this.worker?.terminate();
             // Same readiness wait as generateBackgroundBitmap - unmounting before bgSketch's
@@ -252,6 +291,11 @@
                 const height = window.innerHeight;
                 canvasEl.width = width;
                 canvasEl.height = height;
+                // { passive: false } so handleWheel's preventDefault() actually stops the
+                // page itself from scrolling while the cursor is over the canvas -
+                // 'wheel' listeners default to passive (preventDefault a no-op) otherwise.
+                canvasEl.addEventListener('wheel', this.handleWheel, { passive: false });
+                canvasEl.addEventListener('mousedown', this.handleMouseDown);
 
                 const backgroundBitmap = await this.generateBackgroundBitmap(width, height);
 
@@ -298,6 +342,7 @@
                     crosshairVisible: this.crosshairVisible,
                     explosionsEnabled: this.explosionsEnabled,
                     debugPanelVisible: this.debugPanelVisible,
+                    densityColors: this.densityColors,
                 }, [offscreenCanvas, backgroundBitmap]);
             },
 
@@ -320,6 +365,10 @@
                 const height = window.innerHeight;
                 canvasEl.width = width;
                 canvasEl.height = height;
+                // canvasKey's remount above means this is a brand new element - the
+                // listener from the old (now-discarded) canvas doesn't carry over.
+                canvasEl.addEventListener('wheel', this.handleWheel, { passive: false });
+                canvasEl.addEventListener('mousedown', this.handleMouseDown);
 
                 const backgroundBitmap = await this.generateBackgroundBitmap(width, height);
                 const offscreenCanvas = canvasEl.transferControlToOffscreen();
@@ -422,6 +471,62 @@
                     this.worker?.postMessage({ type: 'resize', width, height, backgroundBitmap }, [backgroundBitmap]);
                 }, 150);
             },
+            /**
+             * Scroll-to-zoom, toward wherever the cursor is - the web counterpart to the
+             * native binary's mouse-wheel zoom. All the actual camera math (zoom level,
+             * pan offset, applying it to rendering) lives in the worker, since it owns
+             * all simulation/camera state; this just forwards the raw wheel delta and the
+             * cursor's canvas-relative position. e.target is the canvas element itself
+             * (this listener is bound directly to it), and its CSS size always matches
+             * its pixel buffer size 1:1 in this app (canvas.width/height are set to
+             * window.innerWidth/innerHeight with no devicePixelRatio scaling anywhere),
+             * so clientX/Y minus the canvas's bounding rect is already in the same pixel
+             * space the worker's own canvas.width/height use.
+             */
+            handleWheel(e) {
+                e.preventDefault();
+                const rect = e.target.getBoundingClientRect();
+                this.worker?.postMessage({
+                    type: 'wheel',
+                    deltaY: e.deltaY,
+                    mouseX: e.clientX - rect.left,
+                    mouseY: e.clientY - rect.top,
+                });
+            },
+            /**
+             * Click-and-drag panning - the web counterpart to the native binary's
+             * click-drag pan (see main.cpp's mouseButtonCallback/cursorPosCallback). Only
+             * left-click starts a drag (button 0), matching the native app's explicit
+             * GLFW_MOUSE_BUTTON_LEFT check. preventDefault stops the drag from also
+             * selecting page text/triggering an image-drag ghost, a common side effect of
+             * mousedown-and-move gestures over arbitrary page content.
+             */
+            handleMouseDown(e) {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                this.isDragging = true;
+                this.lastMouseX = e.clientX;
+                this.lastMouseY = e.clientY;
+            },
+            /**
+             * Forwards the raw screen-pixel delta since the last event - the worker's
+             * cameraPanX/Y is itself already a screen-space quantity (see
+             * simulation.worker.ts's 'wheel'/'pan' handlers), so unlike the native app's
+             * world-space camera offset (which divides by zoom before accumulating), this
+             * needs no zoom conversion here or in the worker: adding raw screen pixels
+             * directly is what makes the content track the cursor 1:1 at any zoom level.
+             */
+            handleMouseMove(e) {
+                if (!this.isDragging) return;
+                const dx = e.clientX - this.lastMouseX;
+                const dy = e.clientY - this.lastMouseY;
+                this.lastMouseX = e.clientX;
+                this.lastMouseY = e.clientY;
+                this.worker?.postMessage({ type: 'pan', dx, dy });
+            },
+            handleMouseUp() {
+                this.isDragging = false;
+            },
         },
 
         watch: {
@@ -440,6 +545,9 @@
             debugPanelVisible(value) {
                 this.worker?.postMessage({ type: 'setDebugPanelVisible', value });
             },
+            densityColors(value) {
+                this.worker?.postMessage({ type: 'setDensityColors', value });
+            },
         },
     };
 </script>
@@ -455,6 +563,11 @@
 
     .simulation canvas {
         display: block;
+        cursor: grab;
+    }
+
+    .simulation canvas:active {
+        cursor: grabbing;
     }
 
     .debug-panel {

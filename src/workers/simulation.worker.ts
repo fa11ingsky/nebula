@@ -57,6 +57,11 @@ let texturesEnabled = false;
 let crosshairVisible = false;
 let explosionsEnabled = false;
 let debugPanelVisible = false;
+// Color every particle by local crowding (colors.ts's densityRamp) instead of its own
+// color - see simulation.ts's displayAll (CPU paths, driven by collide.ts's per-frame
+// candidate count) and webgpuRenderer.ts's renderWebGPUSimFrame (GPU path, driven by
+// webgpuSim.ts's contact-derived densityOutBuf).
+let densityColors = false;
 
 // Which gravity solver runs each frame - 'tree' (Barnes-Hut, the original path), 'pm'
 // (CPU Particle-Mesh, pmGravity.ts) or 'gpu' (the full WebGPU physics pipeline,
@@ -89,9 +94,21 @@ function getGpuDevice() {
             // Request up to 32KB where the adapter offers it so the 2048 grid (used from
             // ~500k particles up) stays available; autoGridSize caps itself to whatever
             // the device actually granted.
-            const wanted = Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768);
+            const wantedWorkgroupStorage = Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768);
+            // The collide compute shader binds 9 storage buffers (pos, velSnap, props,
+            // cellCount, cellItems, velDelta, prevContacts, newContacts, candidateCount -
+            // see webgpuSim.ts) - one past WebGPU's default maxStorageBuffersPerShaderStage
+            // of 8. Request a higher limit (adapters commonly support 10+, often 16); if
+            // even the adapter's own max can't cover it, pipeline creation itself will
+            // throw and initGpuSim's caller falls back to the CPU PM solver.
+            const wantedStorageBuffers = Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 12);
             try {
-                return await adapter.requestDevice({ requiredLimits: { maxComputeWorkgroupStorageSize: wanted } });
+                return await adapter.requestDevice({
+                    requiredLimits: {
+                        maxComputeWorkgroupStorageSize: wantedWorkgroupStorage,
+                        maxStorageBuffersPerShaderStage: wantedStorageBuffers,
+                    },
+                });
             } catch {
                 return adapter.requestDevice();
             }
@@ -156,7 +173,7 @@ async function initGpuSim() {
             restitution: constants.COLLISION_RESTITUTION,
             surfaceGap: constants.COLLISION_SURFACE_GAP,
             table: getCalibratedTable(worldW / gridN, worldH / gridN, G),
-            densityBlurThreshold: 2,
+            densityBlurThreshold: constants.DENSITY_BLUR_THRESHOLD,
             substepSafetyFactor: constants.SUBSTEP_SAFETY_FACTOR,
             maxSubsteps: constants.MAX_SUBSTEPS,
         });
@@ -190,6 +207,21 @@ let rendererReady = true;
 let tickHandle = null;
 let lastTickTime = 0;
 let smoothedFps = 0;
+
+// Scroll-to-zoom camera state - the web counterpart to main.cpp's CameraState/
+// scrollCallback. cameraZoom scales distances from cameraAnchorX/Y (the world point the
+// camera is otherwise centered on: the live center of mass for the CPU solvers, or the
+// fixed spawn-time world center for the GPU solver - see cpuTick/gpuTick); cameraPanX/Y is
+// the extra screen-space offset a scroll-to-cursor zoom accumulates, updated in the
+// 'wheel' message handler below. Both reset to identity on every resetSim() so a Restart
+// always starts from the default framing.
+const MIN_ZOOM = 0.1, MAX_ZOOM = 20;
+let cameraZoom = 1;
+let cameraPanX = 0, cameraPanY = 0;
+// Updated once per frame by whichever tick function actually ran, so a 'wheel' event (which
+// can fire many times during one scroll gesture) reads the exact anchor the last drawn
+// frame used instead of paying for its own fresh center-of-mass pass.
+let cameraAnchorX = 0, cameraAnchorY = 0;
 
 /**
  * A minimal stand-in for a p5 instance, implementing only the handful of methods the
@@ -235,6 +267,12 @@ function resetSim() {
     state = spawned.state;
     worldCenter = spawned.worldCenter;
 
+    // A fresh spawn is a fresh framing - otherwise a Restart while zoomed/panned in would
+    // carry the old view over onto a swarm at a totally different visual scale.
+    cameraZoom = 1;
+    cameraPanX = 0;
+    cameraPanY = 0;
+
     pmContext = null;
     if (gpuSim) {
         gpuSim.destroy();
@@ -248,7 +286,14 @@ function resetSim() {
     }
 }
 
-function renderFrame(com, offsetX, offsetY) {
+/**
+ * `crosshairX/Y` is precomputed by the caller as the screen position the camera anchor
+ * (COM or fixed world center - see cpuTick/gpuTick) always maps to regardless of zoom
+ * (screenCenter + cameraPan) - see the wheel handler's derivation for why that's anchor-
+ * and zoom-independent. Passing it in already-resolved keeps this function (and the WGSL
+ * crosshair shader) from needing to know which anchor convention the caller used.
+ */
+function renderFrame(com, offsetX, offsetY, zoom, crosshairX, crosshairY) {
     if (renderBackend === 'webgpu') {
         if (!rendererReady || !gpuRenderer) {
             return; // mid-switch - keep stepping physics, just don't draw yet
@@ -257,8 +302,9 @@ function renderFrame(com, offsetX, offsetY) {
             gpuRenderer,
             state,
             explosions,
-            { offsetX, offsetY, comX: com.x, comY: com.y },
-            crosshairVisible
+            { offsetX, offsetY, zoom, crosshairX, crosshairY },
+            crosshairVisible,
+            densityColors
         );
         return;
     }
@@ -271,23 +317,27 @@ function renderFrame(com, offsetX, offsetY) {
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
+    ctx.scale(zoom, zoom);
 
-    simulation.displayAll(p5Shim, state, texturesEnabled);
+    simulation.displayAll(p5Shim, state, texturesEnabled, densityColors);
 
     for (const explosion of explosions) {
         explosion.display(p5Shim);
     }
 
     // Marks the center of mass - should render pinned to the middle of the screen every
-    // frame, since the camera is centered on it.
+    // frame, since the camera is centered on it. Arm length and stroke width are divided
+    // by zoom so the marker stays a constant on-screen size instead of scaling with it -
+    // ctx.scale above affects every subsequent draw call, this one included.
     if (crosshairVisible) {
+        const armHalf = 8 / zoom;
         ctx.strokeStyle = 'rgb(255, 255, 255)';
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 1.5 / zoom;
         ctx.beginPath();
-        ctx.moveTo(com.x - 8, com.y);
-        ctx.lineTo(com.x + 8, com.y);
-        ctx.moveTo(com.x, com.y - 8);
-        ctx.lineTo(com.x, com.y + 8);
+        ctx.moveTo(com.x - armHalf, com.y);
+        ctx.lineTo(com.x + armHalf, com.y);
+        ctx.moveTo(com.x, com.y - armHalf);
+        ctx.lineTo(com.x, com.y + armHalf);
         ctx.stroke();
     }
 
@@ -320,10 +370,14 @@ function cpuTick() {
     // zero - never moves on its own. Locking the view to it keeps the system centered
     // on screen even while individual particles get flung outward by gravity. Only the
     // particles/marker shift with the camera; the nebula backdrop is drawn unshifted,
-    // as if at infinity.
+    // as if at infinity. cameraZoom/cameraPan (see the 'wheel' handler) layer scroll-to-
+    // cursor zoom on top of that same COM-centered framing.
     const com = simulation.computeCenterOfMass(state);
-    const offsetX = canvas.width / 2 - com.x;
-    const offsetY = canvas.height / 2 - com.y;
+    cameraAnchorX = com.x;
+    cameraAnchorY = com.y;
+    const screenCenterX = canvas.width / 2, screenCenterY = canvas.height / 2;
+    const offsetX = screenCenterX - com.x * cameraZoom + cameraPanX;
+    const offsetY = screenCenterY - com.y * cameraZoom + cameraPanY;
 
     if (debugPanelVisible) {
         // Relative to the FIXED spawn-time world center, not the live canvas
@@ -346,7 +400,7 @@ function cpuTick() {
         });
     }
 
-    renderFrame(com, offsetX, offsetY);
+    renderFrame(com, offsetX, offsetY, cameraZoom, screenCenterX + cameraPanX, screenCenterY + cameraPanY);
 }
 
 /**
@@ -373,9 +427,17 @@ function gpuTick() {
     gpuSim.device.queue.submit([encoder.finish()]);
     gpuSim.pollReadback();
 
-    const offsetX = canvas.width / 2 - worldCenter.x;
-    const offsetY = canvas.height / 2 - worldCenter.y;
-    renderWebGPUSimFrame(gpuRenderer, { offsetX, offsetY, comX: gpuStats.comX, comY: gpuStats.comY }, crosshairVisible);
+    cameraAnchorX = worldCenter.x;
+    cameraAnchorY = worldCenter.y;
+    const screenCenterX = canvas.width / 2, screenCenterY = canvas.height / 2;
+    const offsetX = screenCenterX - worldCenter.x * cameraZoom + cameraPanX;
+    const offsetY = screenCenterY - worldCenter.y * cameraZoom + cameraPanY;
+    renderWebGPUSimFrame(
+        gpuRenderer,
+        { offsetX, offsetY, zoom: cameraZoom, crosshairX: screenCenterX + cameraPanX, crosshairY: screenCenterY + cameraPanY },
+        crosshairVisible,
+        densityColors
+    );
 
     const now = performance.now();
     if ((debugPanelVisible || crosshairVisible) && !gpuStats.comReadInFlight && now - gpuStats.lastComRead > 1000) {
@@ -512,6 +574,7 @@ self.onmessage = (event) => {
             crosshairVisible = msg.crosshairVisible;
             explosionsEnabled = msg.explosionsEnabled;
             debugPanelVisible = msg.debugPanelVisible;
+            densityColors = msg.densityColors;
 
             resetSim();
 
@@ -615,6 +678,55 @@ self.onmessage = (event) => {
 
         case 'setDebugPanelVisible': {
             debugPanelVisible = msg.value;
+            break;
+        }
+
+        case 'setDensityColors': {
+            densityColors = msg.value;
+            break;
+        }
+
+        case 'wheel': {
+            // Scroll-to-cursor zoom - the web counterpart to main.cpp's scrollCallback.
+            // Solve for the world point currently under the cursor at the OLD zoom, update
+            // zoom, then re-solve cameraPan so that same world point still lands under the
+            // cursor at the NEW zoom (the standard "zoom toward cursor" trick - see
+            // main.cpp's own comment for the identical algebra). cameraAnchorX/Y is
+            // whichever anchor last frame's tick actually rendered with (live COM for the
+            // CPU solvers, the fixed world center for the GPU solver), read as a cached
+            // value rather than recomputed here since a fast scroll gesture can fire many
+            // of these between rendered frames.
+            if (!canvas) break;
+            const screenCenterX = canvas.width / 2, screenCenterY = canvas.height / 2;
+            const worldUnderMouseX = cameraAnchorX + (msg.mouseX - screenCenterX - cameraPanX) / cameraZoom;
+            const worldUnderMouseY = cameraAnchorY + (msg.mouseY - screenCenterY - cameraPanY) / cameraZoom;
+
+            // Wheel deltaY convention: scrolling up/away from the user is negative in the
+            // DOM WheelEvent spec, so negating it before the exponent makes "scroll up/
+            // away zooms in" - matching main.cpp's GLFW-based scrollCallback. Dividing by
+            // 100 approximates one native scroll "notch" (a 1.1x step) per ~100 units of
+            // deltaY - the common step size a traditional mouse wheel reports in Chrome's
+            // default DOM_DELTA_PIXEL mode; trackpads report much smaller continuous
+            // deltas, which fall out of this same formula as proportionally smaller smooth
+            // zoom steps rather than full notches.
+            cameraZoom *= Math.pow(1.1, -msg.deltaY / 100);
+            cameraZoom = Math.min(Math.max(cameraZoom, MIN_ZOOM), MAX_ZOOM);
+
+            cameraPanX = msg.mouseX - screenCenterX - (worldUnderMouseX - cameraAnchorX) * cameraZoom;
+            cameraPanY = msg.mouseY - screenCenterY - (worldUnderMouseY - cameraAnchorY) * cameraZoom;
+            break;
+        }
+
+        case 'pan': {
+            // Click-and-drag panning - the web counterpart to main.cpp's cursorPosCallback.
+            // cameraPanX/Y is already a screen-space quantity (see the offsetX/Y formulas
+            // in cpuTick/gpuTick: offset = screenCenter - anchor*zoom + pan), so the raw
+            // mouse-movement delta gets added directly with no zoom conversion - unlike the
+            // native app's world-space camera offset (which divides by zoom before
+            // accumulating), adding screen pixels straight through is what makes the
+            // content track the cursor 1:1 regardless of the current zoom level.
+            cameraPanX += msg.dx;
+            cameraPanY += msg.dy;
             break;
         }
 

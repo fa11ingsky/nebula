@@ -1,7 +1,7 @@
 export default {
     // Shown in the debug panel - bump manually as a quick way to tell, at a glance,
     // whether a deployed build actually picked up recent changes.
-    VERSION: '0.2.0',
+    VERSION: '0.2.1',
     MAX_MASS: 500,
     // Six-stop gradient a particle sweeps through as it gains mass, smallest to heaviest.
     COLORS: {
@@ -101,7 +101,7 @@ export default {
     GRAVITATIONAL_CONSTANT_OPTIONS: [0.1, 0.5, 1, 2],
     // The six-figure options are realistically only usable with the 'gpu' gravity solver
     // (and its WebGPU rendering) - the tree/Canvas2D combination will crawl there.
-    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000, 25000, 50000, 100000, 250000, 1000000],
+    TOTAL_PARTICLES_OPTIONS: [100, 1000, 2500, 4000, 8000, 10000, 25000, 50000, 100000, 250000],
     // Barnes-Hut opening angle: a distant cluster of particles is treated as one point mass
     // at its center of mass once (node size / distance) < this, instead of visiting every
     // particle inside it individually. 0.5 is the classic Barnes & Hut (1986) value - a good
@@ -198,5 +198,36 @@ export default {
     // resolveOverlap. Purely cosmetic: without it, two bounced circles can render with
     // their edges exactly coincident (or overlapping by a sub-pixel floating-point
     // residue), which reads as a visual glitch even though it's numerically correct.
-    COLLISION_SURFACE_GAP: 0
+    COLLISION_SURFACE_GAP: 0,
+    // Rendering only (colors.ts's densityRamp, particleSystem.ts's `density` field): a
+    // particle's collision candidate/contact count - already computed every frame by
+    // collide.ts's broad-phase search (CPU paths) or the GPU solver's Jacobi collision
+    // pass (webgpuSim.ts) - divided by this, clamped to 1, and sqrt'd (see collide.ts's
+    // comment on why the sqrt: a plain linear ratio saturates almost the entire dense
+    // part of the swarm to the ramp's exact final color, reading as one flat block
+    // instead of a gradient) gives the 0..1 "how crowded is this particle's
+    // neighborhood" factor the density color mode ramps through. Lower = the ramp
+    // saturates at lighter crowding. Applies identically on the GPU solver path
+    // (simulation.worker.ts passes this straight through to webgpuSim.ts).
+    DENSITY_BLUR_THRESHOLD: 100,
+    // The density color mode's ("Color by Density" in Settings) heat-ramp palette -
+    // colors.ts's densityRamp interpolates through these stops (via the same
+    // interpolateColorStops helper the mass gradient above uses), evenly spaced across a
+    // particle's local-crowding value from 0 (fully isolated) to 1 (packed as densely as
+    // DENSITY_BLUR_THRESHOLD considers "maximally crowded"). Add, remove, reorder, or
+    // recolor stops freely - interpolateColorStops adapts to however many are here, it
+    // doesn't assume exactly four.
+    //
+    // GPU-solver mode (webgpuSim.ts) can't read this array live - its color ramp is
+    // compiled into the render pipeline's WGSL shader source once, in
+    // webgpuRenderer.ts's attachSimBuffers, which regenerates that shader from these same
+    // stops every time the GPU sim (re)builds (i.e. on Restart or a solver switch) - so a
+    // change here takes effect immediately on the CPU/Canvas2D and WebGPU-render paths,
+    // but needs a Restart to reach the GPU-solver path.
+    DENSITY_COLOR_STOPS: [
+        [0, 83, 192],  // isolated - cool blue
+        [2, 66, 16],   // mid-density - red
+        [212, 44, 44],  // dense - yellow
+        [216, 255, 44], // packed core - white rgb(0, 83, 192)
+    ]
 }

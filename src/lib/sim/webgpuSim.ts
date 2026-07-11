@@ -149,6 +149,14 @@ export async function createWebGPUSim(device, system, opts) {
     const densityOutBuf = mkBuf(count * 4, S);
     const contactBufA = mkBuf(count * 4, S | CD);
     const contactBufB = mkBuf(count * 4, S | CD);
+    // Density color mode's local-crowding signal (see the collide shader's candidateCount
+    // and applySrc below) - deliberately a SEPARATE tally from contactBufA/B: those drive
+    // the Jacobi under-relaxation factor (omega) and must stay based on actual resolved
+    // contacts for physics correctness (see this file's header comment on why under-
+    // relaxation exists at all), while collide.ts's density signal counts every neighbor
+    // within the search radius regardless of whether a contact/bounce/overlap actually
+    // occurred - matching that (not the contacts count) is what this buffer is for.
+    const candidateCountBuf = mkBuf(count * 4, S);
     const colorRadiusBuf = mkBuf(count * 16, S | CD, colorRadius);
 
     const densityGridBuf = mkBuf(padCells * 4, S | CD);
@@ -252,7 +260,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 @group(0) @binding(5) var<storage, read_write> velDelta: array<vec4f>; // xy = new vel, zw = pos correction
 @group(0) @binding(6) var<storage, read> prevContacts: array<u32>;
 @group(0) @binding(7) var<storage, read_write> newContacts: array<u32>;
-@group(0) @binding(8) var<uniform> frame: Frame;
+@group(0) @binding(8) var<storage, read_write> candidateCount: array<u32>;
+@group(0) @binding(9) var<uniform> frame: Frame;
 
 fn pairPE(mi: f32, mj: f32, ri: f32, rj: f32, dist: f32) -> f32 {
     let combR = ri + rj;
@@ -275,6 +284,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     var dVel = vec2f(0.0);
     var myDelta = vec2f(0.0);
     var contacts = 0u;
+    // Density color mode's tally (see candidateCountBuf's declaration comment) - every
+    // neighbor within searchR counts, matching collide.ts's density signal exactly (that
+    // broad-phase search radius query, with no further contact/bounce/overlap filtering)
+    // rather than the stricter contacts count below, which under-relaxation needs kept
+    // as actual resolved contacts.
+    var candidates = 0u;
     let myPrevContacts = f32(max(prevContacts[i], 1u));
 
     let cc = vec2i((pi - BIN_ORIGIN) / frame.cellSize);
@@ -290,6 +305,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
                 let pj = pos[j];
                 let endD = pj - pi;
                 if (dot(endD, endD) > searchR2) { continue; }
+                candidates++;
 
                 let vj = velSnap[j];
                 let invMj = props[j].x;
@@ -370,13 +386,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     velDelta[i] = vec4f(vi + dVel, myDelta);
     newContacts[i] = contacts;
+    candidateCount[i] = candidates;
 }`;
 
     const applySrc = consts + /* wgsl */ `
 @group(0) @binding(0) var<storage, read_write> pos: array<vec2f>;
 @group(0) @binding(1) var<storage, read_write> vel: array<vec2f>;
 @group(0) @binding(2) var<storage, read> velDelta: array<vec4f>;
-@group(0) @binding(3) var<storage, read> newContacts: array<u32>;
+@group(0) @binding(3) var<storage, read> candidateCount: array<u32>;
 @group(0) @binding(4) var<storage, read_write> densityOut: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -384,7 +401,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (i >= COUNT) { return; }
     vel[i] = velDelta[i].xy;
     pos[i] += velDelta[i].zw;
-    densityOut[i] = min(f32(newContacts[i]) / BLUR_THRESHOLD, 1.0);
+    // sqrt so the density color ramp's early stops get most of the visible range and only
+    // truly extreme crowding reaches the final stop - see collide.ts's identical CPU-path
+    // formula for why a plain linear ratio reads as one flat block of solid color instead.
+    // candidateCount (not the collide pass's contacts tally - see that buffer's own
+    // declaration comment) matches collide.ts's density signal: every neighbor within the
+    // search radius, not just the ones that actually bounced or overlapped.
+    densityOut[i] = sqrt(min(f32(candidateCount[i]) / BLUR_THRESHOLD, 1.0));
 }`;
 
     const depositSrc = consts + /* wgsl */ `
@@ -620,11 +643,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     const bgBin = bg(pipeBin, [posBuf, cellCountBuf, cellItemsBuf, frameUniform]);
     // Two collide bind groups: contact counts ping-pong between substeps (the pass reads
     // LAST substep's counts - frozen, so both sides of a pair derive the identical
-    // under-relaxation factor - and writes this substep's).
-    const bgCollideAB = bg(pipeCollide, [posBuf, velSnapBuf, propsBuf, cellCountBuf, cellItemsBuf, velDeltaBuf, contactBufA, contactBufB, frameUniform]);
-    const bgCollideBA = bg(pipeCollide, [posBuf, velSnapBuf, propsBuf, cellCountBuf, cellItemsBuf, velDeltaBuf, contactBufB, contactBufA, frameUniform]);
-    const bgApplyB = bg(pipeApply, [posBuf, velBuf, velDeltaBuf, contactBufB, densityOutBuf]);
-    const bgApplyA = bg(pipeApply, [posBuf, velBuf, velDeltaBuf, contactBufA, densityOutBuf]);
+    // under-relaxation factor - and writes this substep's). candidateCountBuf doesn't
+    // ping-pong - it's write-only-then-read-once-per-substep (apply), no cross-substep
+    // dependency the way the omega under-relaxation factor has.
+    const bgCollideAB = bg(pipeCollide, [posBuf, velSnapBuf, propsBuf, cellCountBuf, cellItemsBuf, velDeltaBuf, contactBufA, contactBufB, candidateCountBuf, frameUniform]);
+    const bgCollideBA = bg(pipeCollide, [posBuf, velSnapBuf, propsBuf, cellCountBuf, cellItemsBuf, velDeltaBuf, contactBufB, contactBufA, candidateCountBuf, frameUniform]);
+    // No longer ping-ponged (candidateCountBuf replaced the old contactBufA/B read here) -
+    // one bind group is enough now that apply doesn't depend on which contact buffer is
+    // "previous" this substep.
+    const bgApply = bg(pipeApply, [posBuf, velBuf, velDeltaBuf, candidateCountBuf, densityOutBuf]);
     const bgDeposit = bg(pipeDeposit, [posBuf, propsBuf, densityGridBuf]);
     const bgDens2Complex = bg(pipeDens2Complex, [densityGridBuf, gridReA, gridImA]);
     const bgFftA_fwd = bg(pipeFftFwd, [gridReA, gridImA]);
@@ -717,9 +744,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             encoder.clearBuffer(densityGridBuf);
             // 4. bin particles into the neighbor grid
             dispatch(pipeBin, bgBin, pGroups);
-            // 5-6. collide (Jacobi) + apply (contact ping-pong across substeps)
+            // 5-6. collide (Jacobi, contact ping-pong across substeps) + apply
             dispatch(pipeCollide, this.contactPing ? bgCollideBA : bgCollideAB, pGroups);
-            dispatch(pipeApply, this.contactPing ? bgApplyA : bgApplyB, pGroups);
+            dispatch(pipeApply, bgApply, pGroups);
             this.contactPing = !this.contactPing;
             // 7. CIC deposit from corrected positions
             dispatch(pipeDeposit, bgDeposit, pGroups);
@@ -796,7 +823,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         destroy() {
             this.destroyed = true;
             for (const b of [posBuf, velBuf, accBuf, propsBuf, velSnapBuf, velDeltaBuf,
-                             densityOutBuf, contactBufA, contactBufB, colorRadiusBuf,
+                             densityOutBuf, contactBufA, contactBufB, candidateCountBuf, colorRadiusBuf,
                              densityGridBuf, gridReA, gridImA, gridReB, gridImB, forceBuf,
                              greensBuf, cellCountBuf, cellItemsBuf, p3mTableBuf, maxBitsBuf,
                              maxBitsStaging, frameUniform]) {
